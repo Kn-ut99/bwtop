@@ -50,6 +50,8 @@ installé sur la machine cible.
   précise (ex. `942100 SQL Injection…`) est affichée.
 - **Flux en direct** avec **colonnes configurables** (heure, IP, code, raison,
   site, méthode, taille, user-agent, URL), largeur et ordre réglables.
+- **Filtre global par service** (`/`) : restreint l'ensemble du tableau de bord
+  à un seul site, avec auto-complétion des services vus et bandeau d'état.
 - **Vue Bans** : liste les bans actifs (portée, site, raison, date, temps
   restant, pays), **unban** d'un ban ou de toutes les portées d'une IP,
   filtre et tri.
@@ -139,8 +141,16 @@ Bascule avec `Tab` ou les touches `1` / `2` / `3`. `h` ouvre l'aide, `q` quitte.
 
 ### 1 — Dashboard
 `p` pause · `w` fenêtre (1 m→5 m→15 m→1 h) · `b` bloquées seulement ·
-`c`/`F2` colonnes · `+`/`-` échelle du graphe · `i`/`v` panneaux ·
-`r` reset · `↑↓ PgUp/PgDn` défiler.
+`/` **filtrer tout le tableau sur un service** · `c`/`F2` colonnes ·
+`+`/`-` échelle du graphe · `i`/`v` panneaux · `r` reset · `↑↓ PgUp/PgDn` défiler.
+
+Le filtre `/` applique un **filtre global par service** : tout le tableau de
+bord (compteurs, codes, raisons, graphe, flux) ne reflète alors que le service
+choisi. La saisie est **auto-complétée** avec les services vus dans la fenêtre
+de temps active (`↹` pour parcourir les propositions), sans bloquer la frappe
+si aucun trafic n'a encore été vu — on peut valider un nom au clavier avec
+`Entrée`. Le service actif s'affiche dans un **bandeau bien visible** en haut
+de l'écran ; `Échap` (ou `/` puis `Entrée` à vide) retire le filtre.
 
 ### 2 — Bans
 `↑↓` choisir · `u` débannir · `U` débannir l'IP partout ·
