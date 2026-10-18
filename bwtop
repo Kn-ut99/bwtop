@@ -31,7 +31,7 @@ import threading
 import time
 from datetime import datetime
 
-VERSION = "1.10.0"
+VERSION = "1.10.1"
 
 WINDOWS = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)]
 RETENTION = 3600            # on garde 1h d'evenements en memoire
@@ -2045,7 +2045,8 @@ class UI:
         self.box(y, x, h, w, title, right)
         iw, rows = w - 4, h - 2
         if not items:
-            self.put(y + 1, x + 2, "(aucune donnée)", curses.A_DIM)
+            self.put(y + 1, x + 2, "(aucune donnée)", curses.A_DIM, iw)
+            self.put(y + 2, x + 2, "fenêtre %s · w pour élargir" % WINDOWS[self.win_idx][0], curses.A_DIM, iw)
             return
         shown = items[:rows]
         rw = 6
@@ -2385,26 +2386,18 @@ class UI:
     def _draw_cpu_box(self, y, x, hh, bw, s):
         self.box(y, x, hh, bw, "CPU")
         iw = bw - 4
-        bar_rows = max(1, hh - 3)                        # dernière ligne intérieure = libellé
         if not s or not s["cpu"]:
             self.put(y + 1, x + 2, "mesure en cours…" if s else "indisponible", curses.A_DIM, iw)
             return
-        cpu = s["cpu"]
-        # une colonne par cœur ; si trop de cœurs pour la largeur, on agrège par paquets
-        ncol = max(1, min(len(cpu), iw))
-        groups = [cpu[i * len(cpu) // ncol:(i + 1) * len(cpu) // ncol] or [0.0] for i in range(ncol)]
-        vals = [sum(g) / len(g) for g in groups]
-        for i, v in enumerate(vals):
-            col = C_OK if v < 50 else C_WARN if v < 85 else C_BAD
-            units = int(round(v / 100.0 * bar_rows * 8))
-            for r in range(bar_rows):
-                fill = max(0, min(8, units - (bar_rows - 1 - r) * 8))
-                if fill:
-                    self.put(y + 1 + r, x + 2 + i, SPARK[fill], self.attr[col], 1)
-        lab = "%d cœurs · moy %.0f%%" % (s["ncpu"], s["cpu_avg"])
-        if len(cpu) != ncol:
-            lab += " · %d barres" % ncol
-        self.put(y + hh - 2, x + 2, lab, curses.A_DIM, iw)
+        avg = s["cpu_avg"]
+        col = C_OK if avg < 60 else C_WARN if avg < 85 else C_BAD
+        # même présentation que la RAM : jauge horizontale + histogramme en dessous
+        self.put(y + 1, x + 2, "%d cœurs · moy" % s["ncpu"], curses.A_BOLD, iw - 5)
+        self.put(y + 1, x + bw - 2 - 4, "%3.0f%%" % avg, self.attr[col] | curses.A_BOLD)
+        self.put(y + 2, x + 2, hbar(avg / 100.0, iw).ljust(iw), self.attr[col], iw)
+        if hh >= 6:
+            self.put(y + 3, x + 2, "historique", curses.A_DIM, iw)
+            self._spark_row(y + hh - 2, x + 2, iw, s["cpu_hist"], 100.0, col)
 
     def _draw_mem_box(self, y, x, hh, bw, s):
         self.box(y, x, hh, bw, "RAM")

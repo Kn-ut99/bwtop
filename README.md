@@ -52,8 +52,8 @@ installé sur la machine cible.
   site, méthode, taille, user-agent, URL), largeur et ordre réglables.
 - **Filtre global par service** (`/`) : restreint l'ensemble du tableau de bord
   à un seul site, avec auto-complétion des services vus et bandeau d'état.
-- **Graphes système** optionnels (`S`) : CPU par cœur, RAM et débit réseau
-  (up/down) de la machine locale, lus dans `/proc` sans dépendance.
+- **Graphes système** optionnels (`S`) : CPU (moyenne + historique), RAM et
+  débit réseau (up/down) de la machine locale, lus dans `/proc` sans dépendance.
 - **Vue Bans** : liste les bans actifs (portée, site, raison, date, temps
   restant, pays), **unban** d'un ban ou de toutes les portées d'une IP,
   filtre et tri.
@@ -156,8 +156,9 @@ si aucun trafic n'a encore été vu — on peut valider un nom au clavier avec
 de l'écran ; `Échap` (ou `/` puis `Entrée` à vide) retire le filtre.
 
 La touche `S` affiche/masque une **rangée de graphes système** (lus dans
-`/proc`, sans dépendance) : **CPU par cœur**, **RAM**, et **débit réseau**
-(montée/descente). Ces graphes mesurent la machine **qui exécute bwtop** (en
+`/proc`, sans dépendance) : **CPU** (charge moyenne + historique), **RAM**, et
+**débit réseau** (montée/descente). Ces graphes mesurent la machine
+**qui exécute bwtop** (en
 général le serveur BunkerWeb lui-même). L'interface réseau est par défaut celle
 de la **route par défaut** ; `n` passe d'une interface physique à l'autre (les
 interfaces virtuelles `lo`/`docker*`/`veth*`/`br-*` sont ignorées), ou on la fixe
