@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+bwtest - validateur de WAF pour TON site BunkerWeb.
+
+Envoie une batterie de signatures d'attaque *inoffensives* (celles que le
+Core Rule Set de ModSecurity reconnait) et verifie que chacune est bloquee
+(403 / 429 / 444 / connexion coupee). But : confirmer que BunkerWeb detecte
+et bloque. Aucune de ces requetes n'est un exploit : ce sont des chaines de
+detection, sans effet si elles atteignaient l'application.
+
+    ./bwtest https://monsite.exemple.fr
+    ./bwtest https://monsite.exemple.fr --delay 0.5 --json rapport.json
+
+A regarder en parallele dans bwtop : les blocages et leurs raisons en direct.
+
+!!! N'utilise ceci QUE sur un site qui t'appartient ou que tu es explicitement
+    autorise a tester. Attends-toi a etre rate-limite puis banni par BunkerWeb
+    pendant le test : c'est le signe que ca marche. Tu pourras te debannir
+    depuis bwtop (vue Bans, touche u).
+
+Aucune dependance : Python 3.8+ (stdlib uniquement).
+"""
+import argparse
+import json
+import ssl
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.0"
+UA_NORMAL = "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0"
+
+# Chaque test : (categorie, nom, méthode, chemin+query, en-tetes, corps).
+# Les payloads sont des signatures CRS classiques, volontairement benignes.
+def build_tests():
+    T = []
+
+    def add(cat, name, where, value, status_expected=True):
+        T.append({"cat": cat, "name": name, "where": where, "value": value, "expect_block": status_expected})
+
+    # -- SQL injection (CRS 942xxx) : chaines de detection, pas d'injection reelle
+    add("SQLi", "OR 1=1 en query", "query", "id=1' OR '1'='1")
+    add("SQLi", "UNION SELECT", "query", "id=-1 UNION SELECT NULL,NULL--")
+    add("SQLi", "commentaire + sleep", "query", "id=1); SELECT pg_sleep(0)--")
+
+    # -- XSS (CRS 941xxx) : alert(1), inoffensif
+    add("XSS", "balise script", "query", "q=<script>alert(1)</script>")
+    add("XSS", "handler onerror", "query", "q=<img src=x onerror=alert(1)>")
+    add("XSS", "javascript: URI", "query", "next=javascript:alert(1)")
+
+    # -- Traversee de repertoire / LFI (CRS 930xxx)
+    add("LFI/Traversal", "../ vers /etc/passwd", "query", "file=../../../../etc/passwd")
+    add("LFI/Traversal", "encodage %2e%2e", "query", "file=%2e%2e%2f%2e%2e%2fetc%2fpasswd")
+
+    # -- Injection de commande / RCE signatures (CRS 932xxx)
+    add("RCE", "point-virgule + commande", "query", "host=127.0.0.1;id")
+    add("RCE", "substitution $( )", "query", "x=$(id)")
+    add("RCE", "Shellshock (en-tete)", "header-ua", "() { :; }; echo vulnerable")
+
+    # -- Fichiers/chemins sensibles souvent sondes par les bots
+    add("Recon", "accès /.env", "path", "/.env")
+    add("Recon", "accès /.git/config", "path", "/.git/config")
+    add("Recon", "wp-login.php", "path", "/wp-login.php")
+    add("Recon", "phpunit eval-stdin", "path", "/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php")
+
+    # -- User-Agents d'outils de scan (CRS 913xxx)
+    add("Scanner-UA", "sqlmap", "header-ua", "sqlmap/1.8")
+    add("Scanner-UA", "Nikto", "header-ua", "Nikto/2.5.0")
+    add("Scanner-UA", "Nmap NSE", "header-ua", "Mozilla/5.0 (compatible; Nmap Scripting Engine)")
+
+    # -- Protocole / en-tetes anormaux
+    add("Protocol", "en-tete vide + injection CRLF", "query", "p=%0d%0aSet-Cookie:x=1")
+    return T
+
+
+def make_opener(insecure, proxy):
+    handlers = [urllib.request.ProxyHandler({} if not proxy else {"http": proxy, "https": proxy})]
+    ctx = ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(*handlers)
+
+
+def _enc(s):
+    """Encode uniquement ce que http.client interdit dans une URL (contrôle, espace, DEL).
+
+    Les % déjà présents et la ponctuation (' < > ; $ ( ) ...) sont laissés tels quels :
+    ModSecurity décode l'URL avant d'analyser, donc c'est transparent pour la détection
+    et c'est exactement ce que fait un navigateur avec une espace (-> %20)."""
+    return "".join("%%%02X" % ord(c) if (c.isspace() or ord(c) < 0x21 or ord(c) == 0x7f) else c for c in s)
+
+
+def do_request(opener, base, test, timeout, block_status, host_header=None):
+    url = base
+    headers = {"User-Agent": UA_NORMAL, "Accept": "*/*"}
+    if host_header:
+        headers["Host"] = host_header
+    where = test["where"]
+    if where == "path":
+        url = urllib.parse.urljoin(base, _enc(test["value"]))
+    elif where == "query":
+        sep = "&" if urllib.parse.urlparse(base).query else "?"
+        url = base + sep + _enc(test["value"])
+    elif where == "header-ua":
+        headers["User-Agent"] = test["value"]
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    t0 = time.monotonic()
+    try:
+        with opener.open(req, timeout=timeout) as r:
+            code = r.status
+            r.read(2048)
+    except urllib.error.HTTPError as e:
+        code = e.code
+    except (urllib.error.URLError, ssl.SSLError, OSError) as e:
+        # Connexion coupee / refusee : BunkerWeb peut droper (444) en coupant la socket.
+        reason = getattr(e, "reason", e)
+        return {"blocked": True, "code": "drop", "ms": (time.monotonic() - t0) * 1000,
+                "detail": "connexion coupée/refusée (%s)" % (getattr(reason, "strerror", None) or reason)}
+    blocked = code in block_status
+    return {"blocked": blocked, "code": code, "ms": (time.monotonic() - t0) * 1000, "detail": ""}
+
+
+# Couleurs ANSI (desactivees si pas un terminal)
+def _c(code):
+    return "" if not sys.stdout.isatty() else code
+R, G, Y, B, DIM, RST = (_c("\033[31m"), _c("\033[32m"), _c("\033[33m"),
+                        _c("\033[1m"), _c("\033[2m"), _c("\033[0m"))
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="bwtest", description="Valide que TON BunkerWeb bloque les attaques (signatures inoffensives).")
+    ap.add_argument("url", help="URL de base de ton site (ex. https://monsite.exemple.fr)")
+    ap.add_argument("--delay", type=float, default=0.4, help="pause entre requêtes en s (défaut 0.4)")
+    ap.add_argument("--timeout", type=float, default=10.0, help="timeout par requête en s (défaut 10)")
+    ap.add_argument("--block-status", default="403,429,444,406,501",
+                    help="codes considérés comme 'bloqué' (défaut 403,429,444,406,501)")
+    ap.add_argument("--host", help="en-tête Host à forcer (si tu testes par IP)")
+    ap.add_argument("--insecure", action="store_true", help="ne pas vérifier le certificat TLS")
+    ap.add_argument("--proxy", help="proxy HTTP(S) à traverser")
+    ap.add_argument("--json", metavar="FICHIER", help="écrit le rapport détaillé en JSON")
+    ap.add_argument("--yes", action="store_true", help="ne pas demander de confirmation")
+    ap.add_argument("-V", "--version", action="version", version="bwtest " + VERSION)
+    args = ap.parse_args()
+
+    try:
+        block_status = {int(x) for x in args.block_status.split(",") if x.strip()}
+    except ValueError:
+        ap.error("--block-status : liste de codes séparés par des virgules")
+
+    parsed = urllib.parse.urlparse(args.url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        ap.error("URL invalide : attendu http(s)://hôte[/chemin]")
+
+    print("%sbwtest %s%s — cible : %s%s%s" % (B, VERSION, RST, B, args.url, RST))
+    print("%sN'utilise ceci que sur un site qui t'appartient ou que tu es autorisé à tester.%s" % (Y, RST))
+    print("%sBunkerWeb va probablement te bannir pendant le test ; débannis-toi ensuite depuis bwtop.%s" % (DIM, RST))
+    if not args.yes and sys.stdin.isatty():
+        try:
+            if input("Confirmer le test de ce site ? [o/N] ").strip().lower() not in ("o", "oui", "y", "yes"):
+                print("Annulé.")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("\nAnnulé.")
+            return
+
+    opener = make_opener(args.insecure, args.proxy)
+
+    # 1) Baseline : une requete legitime doit passer (sinon le reste n'a pas de sens).
+    base_ok = do_request(opener, args.url, {"where": "path", "value": ""}, args.timeout, block_status, args.host)
+    print("\n%sBaseline%s (requête légitime) : code %s%s%s  — %s" % (
+        B, RST, (R if base_ok["blocked"] else G), base_ok["code"], RST,
+        "le site répond" if not base_ok["blocked"] else "%sattention : la requête normale est bloquée ou le site est down%s" % (Y, RST)))
+
+    tests = build_tests()
+    print("\n%-16s %-26s %-6s %s" % ("CATÉGORIE", "TEST", "CODE", "RÉSULTAT"))
+    print("─" * 72)
+    results = []
+    blocked_n = 0
+    by_cat = {}
+    for t in tests:
+        res = do_request(opener, args.url, t, args.timeout, block_status, args.host)
+        ok = res["blocked"]
+        blocked_n += ok
+        c = by_cat.setdefault(t["cat"], [0, 0])
+        c[0] += ok
+        c[1] += 1
+        tag = "%s✔ bloqué%s" % (G, RST) if ok else "%s✘ PASSÉ (non bloqué)%s" % (R, RST)
+        print("%-16s %-26s %-6s %s %s" % (t["cat"], t["name"], res["code"], tag, DIM + res["detail"] + RST if res["detail"] else ""))
+        results.append({**{k: t[k] for k in ("cat", "name", "where", "value")}, **res})
+        time.sleep(args.delay)
+
+    n = len(tests)
+    print("─" * 72)
+    print("\n%sRésultat : %d/%d signatures bloquées (%.0f%%)%s" % (
+        B, blocked_n, n, 100.0 * blocked_n / n if n else 0, RST))
+    for cat in sorted(by_cat):
+        ok, tot = by_cat[cat]
+        col = G if ok == tot else (Y if ok else R)
+        print("  %s%-16s %d/%d%s" % (col, cat, ok, tot, RST))
+    passed = [r for r in results if not r["blocked"]]
+    if passed:
+        print("\n%s%d signature(s) NON bloquée(s) — à examiner :%s" % (R, len(passed), RST))
+        for r in passed:
+            print("  - [%s] %s (code %s)" % (r["cat"], r["name"], r["code"]))
+        print("%sUn code 404 peut être normal si l'URL n'existe pas chez toi ; ce qui compte, c'est que%s" % (DIM, RST))
+        print("%sles payloads SQLi/XSS/RCE ci-dessus soient bien bloqués AVANT d'atteindre ton application.%s" % (DIM, RST))
+    else:
+        print("\n%sToutes les signatures ont été bloquées.%s" % (G, RST))
+
+    if args.json:
+        report = {"version": VERSION, "url": args.url, "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                  "baseline": base_ok, "blocked": blocked_n, "total": n,
+                  "by_category": {k: {"blocked": v[0], "total": v[1]} for k, v in by_cat.items()},
+                  "results": results}
+        try:
+            with open(args.json, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, ensure_ascii=False)
+            print("\nRapport JSON : %s" % args.json)
+        except OSError as e:
+            print("%sÉcriture du JSON impossible : %s%s" % (R, e, RST))
+
+    # Code de sortie : 0 si tout est bloqué et baseline OK, 1 sinon (utile en CI).
+    sys.exit(0 if (not passed and not base_ok["blocked"]) else 1)
+
+
+if __name__ == "__main__":
+    main()

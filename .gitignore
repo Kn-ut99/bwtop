@@ -1,0 +1,17 @@
+# Artefacts de compilation PyInstaller
+build/
+dist/
+*.spec
+.build-venv/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Config/secret locaux (ne jamais committer)
+bwtop.env
+config.json
+
+# Divers
+*.log
+.DS_Store

@@ -1,0 +1,3503 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+bwtop - dashboard temps reel (curses) pour BunkerWeb, façon htop / btop.
+
+Sources de logs possibles :
+  * fichiers   : bwtop -a /var/log/bunkerweb/access.log -e /var/log/bunkerweb/error.log
+  * docker     : bwtop --docker bunkerweb
+  * stdin      : ssh srv docker logs -f bunkerweb 2>&1 | bwtop -
+  * demo       : bwtop --demo        (trafic synthetique, pour tester l'affichage)
+
+Touches principales : Tab bascule Dashboard <-> Bans (unban avec u), c configure les colonnes,
+h affiche l'aide. Les bans sont lus via l'API interne de BunkerWeb (la meme que bwcli), dont
+l'adresse, le Host et le jeton sont lus dans /etc/bunkerweb/variables.env.
+
+Aucune dependance externe : Python 3.8+ et le module standard `curses`.
+"""
+import argparse
+import calendar
+import collections
+import curses
+import heapq
+import locale
+import os
+import queue
+import random
+import re
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+
+VERSION = "1.8.0"
+
+WINDOWS = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)]
+RETENTION = 3600            # on garde 1h d'evenements en memoire
+MAX_EVENTS = 400_000        # garde-fou memoire
+RESOLVE_DELAY = 1.5         # s d'attente avant d'attribuer une raison a un blocage
+CORR_WINDOW = 5.0           # s de tolerance entre ligne access.log et error.log
+DEFAULT_BLOCK_STATUS = (403, 429, 444)
+
+# --------------------------------------------------------------------------- #
+#  Parsing des logs
+# --------------------------------------------------------------------------- #
+
+# Formats acceptes (le premier est le LOG_FORMAT par defaut de BunkerWeb 1.6.x) :
+#   $host $remote_addr - $request_id $remote_user [$time_local] "$request" ...
+#   $host $remote_addr - $remote_user [$time_local] "$request" ...       (BunkerWeb plus ancien)
+#   $remote_addr - $remote_user [$time_local] "$request" ...             (nginx "combined")
+ACCESS_RE = re.compile(
+    r'(?:(?P<host>[^\s"\[\]]+) )?(?P<ip>[0-9a-fA-F:.]{3,45}) - (?:(?P<rid>[0-9a-f]{32}) )?\S+ '
+    r'\[(?P<time>\d\d/\w{3}/\d{4}:[^\]]+)\] '
+    r'"(?P<req>[^"]*)" (?P<status>\d{3}) (?P<size>\d+|-)'
+    r'(?: "(?P<ref>[^"]*)" "(?P<ua>[^"]*)")?'
+)
+ERROR_RE = re.compile(r'^(?P<time>\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(?P<level>\w+)\] ')
+DOCKER_TS_RE = re.compile(r'^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)? ')
+
+IP_RE = re.compile(r'(?:client:? |\[client |\bIP |\bip |\bremote_addr:? )\[?([0-9a-fA-F:.]{3,45})')
+REQ_RE = re.compile(r'request: "[A-Z]+ (\S+) HTTP/[\d.]+"')
+URI_RE = re.compile(r'\[uri "([^"]*)"\]')
+MSG_RE = re.compile(r'\[msg "((?:[^"\\]|\\.)*)"\]')
+ID_RE = re.compile(r'\[id "(\d+)"\]')
+WHITELIST_RE = re.compile(r'whitelist|allowlist', re.I)
+HOST_ERR_RE = re.compile(r'(?:,|^|\s)host: "([^"]*)"')
+SERVER_ERR_RE = re.compile(r'(?:,|\s)server: (\S+?)(?:,|\s|$)')
+
+# ---> Categories de blocage detectees dans l'error.log (ordre = priorite).
+#      Adapte librement ces motifs a ta version / tes plugins BunkerWeb.
+REASON_RULES = [
+    ("crowdsec",     re.compile(r'crowdsec', re.I)),
+    ("dnsbl",        re.compile(r'dnsbl', re.I)),
+    ("antibot",      re.compile(r'antibot|captcha|challenge', re.I)),
+    ("rate-limit",   re.compile(r'limiting requests|limit[_ -]?req|rate[ -]?limit|too many requests', re.I)),
+    ("conn-limit",   re.compile(r'limiting connections|limit[_ -]?conn', re.I)),
+    ("bad-behavior", re.compile(r'bad[ _-]?behavior|increased counter', re.I)),
+    ("banned",       re.compile(r'\bban(?:ned)?\b', re.I)),
+    ("blacklist",    re.compile(r'blacklist|denylist', re.I)),
+    ("country",      re.compile(r'\bcountry\b', re.I)),
+    ("auth-basic",   re.compile(r'was not found in|password mismatch|no user/password', re.I)),
+]
+ANOMALY_IDS = {"949110", "959100", "980130"}   # regles CRS "score global" (peu parlantes)
+
+MONTHS = {m: i + 1 for i, m in enumerate("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split())}
+_clf_cache, _err_cache = {}, {}
+_clean_re = re.compile(r'[^\x20-\x7e]')
+
+
+def parse_clf(s):
+    """'17/Oct/2026:12:34:56 +0200' -> epoch (sans dependre de la locale)."""
+    v = _clf_cache.get(s)
+    if v is None:
+        try:
+            ts = calendar.timegm((int(s[7:11]), MONTHS[s[3:6]], int(s[0:2]),
+                                  int(s[12:14]), int(s[15:17]), int(s[18:20])))
+            tz = s[21:26]
+            if len(tz) == 5 and tz[0] in "+-":
+                off = (int(tz[1:3]) * 3600 + int(tz[3:5]) * 60) * (1 if tz[0] == "+" else -1)
+                ts -= off
+            v = float(ts)
+        except (ValueError, KeyError, IndexError):
+            v = time.time()
+        if len(_clf_cache) > 10000:
+            _clf_cache.clear()
+        _clf_cache[s] = v
+    return v
+
+
+def parse_err_time(s):
+    """'2026/10/17 12:34:56' (heure locale du serveur) -> epoch."""
+    v = _err_cache.get(s)
+    if v is None:
+        try:
+            v = time.mktime(time.strptime(s, "%Y/%m/%d %H:%M:%S"))
+        except ValueError:
+            v = time.time()
+        if len(_err_cache) > 10000:
+            _err_cache.clear()
+        _err_cache[s] = v
+    return v
+
+
+def clean(s, n):
+    return _clean_re.sub("?", s[:n])
+
+
+def classify_error(line):
+    """Retourne (ip, categorie, detail, deny, uri) ou None."""
+    if WHITELIST_RE.search(line) and "blacklist" not in line.lower():
+        return None
+    mi = IP_RE.search(line)
+    if not mi:
+        return None
+    ip = mi.group(1).rstrip(":.")
+    mu = REQ_RE.search(line) or URI_RE.search(line)
+    uri = mu.group(1) if mu else ""
+
+    if "ModSecurity" in line:
+        deny = "Access denied" in line
+        if not deny and "ModSecurity: Warning" not in line:
+            return None
+        mid, mmsg = ID_RE.search(line), MSG_RE.search(line)
+        rid = mid.group(1) if mid else ""
+        msg = mmsg.group(1) if mmsg else ""
+        detail = (rid + " " + msg).strip()
+        if rid in ANOMALY_IDS and not deny:
+            detail = ""
+        return ip, "modsecurity", clean(detail, 90), deny, uri
+
+    for cat, rx in REASON_RULES:
+        if rx.search(line):
+            return ip, cat, "", True, uri
+    return None
+
+
+# --------------------------------------------------------------------------- #
+#  Moteur de statistiques
+# --------------------------------------------------------------------------- #
+
+class Ev:
+    __slots__ = ("ts", "ip", "method", "path", "status", "size", "ua",
+                 "blocked", "reason", "detail", "resolved", "inwin", "arr", "host")
+
+
+def _bump(c, k, s):
+    n = c.get(k, 0) + s
+    if n > 0:
+        c[k] = n
+    else:
+        c.pop(k, None)
+
+
+def top(counter, n):
+    return heapq.nlargest(n, counter.items(), key=lambda kv: kv[1])
+
+
+class Engine:
+    def __init__(self, q, block_status, access_re=None, dump_path=None, keep_internal=False):
+        self.q = q
+        self.keep_internal = keep_internal
+        self.block_status = set(block_status)
+        self.access_re = access_re or ACCESS_RE
+        self.dump = open(dump_path, "a") if dump_path else None
+        self.notes = {}                       # messages d'etat des lecteurs
+        self.window_secs = 300
+        self.start = time.time()
+        self.seq = 0
+        self.seen_host = False
+        self.modsec = {}          # (host, rule_id) -> agrégat des déclenchements ModSecurity
+        self.reset()
+
+    # -- etat ------------------------------------------------------------- #
+    def reset(self):
+        self.events = collections.deque()      # tous (1h)
+        self.modsec = {}
+        self.win = collections.deque()         # dans la fenetre courante
+        self.blocked_events = collections.deque()
+        self.pending = collections.deque()
+        self.rindex = {}
+        self.sec = {}
+        self.tot_req = self.tot_blocked = self.tot_bytes = 0
+        self.unparsed = 0
+        self._clear_counters()
+        self._last_prune = time.monotonic()
+
+    def _clear_counters(self):
+        self.w_total = self.w_blocked = self.w_bytes = 0
+        self.c_cls = {}        # 2xx..5xx
+        self.c_method = {}
+        self.c_ip = {}         # tous les clients
+        self.c_bstatus = {}    # 403 / 429 / 444
+        self.c_reason = {}
+        self.c_bip = {}
+        self.c_burl = {}
+        self.c_bua = {}
+        self.c_rule = {}
+        self.c_host = {}       # sites (toutes requetes)
+        self.c_bhost = {}      # sites (bloquees)
+
+    def _apply_base(self, ev, s):
+        self.w_total += s
+        self.w_bytes += s * ev.size
+        _bump(self.c_cls, ev.status // 100, s)
+        _bump(self.c_method, ev.method, s)
+        _bump(self.c_ip, ev.ip, s)
+        if ev.host:
+            _bump(self.c_host, ev.host, s)
+        if ev.blocked:
+            self.w_blocked += s
+            _bump(self.c_bstatus, ev.status, s)
+
+    def _apply_blocked(self, ev, s):
+        _bump(self.c_reason, ev.reason, s)
+        _bump(self.c_bip, ev.ip, s)
+        if ev.host:
+            _bump(self.c_bhost, ev.host, s)
+        _bump(self.c_burl, ev.path.split("?", 1)[0], s)
+        if ev.ua:
+            _bump(self.c_bua, ev.ua, s)
+        if ev.reason == "modsecurity" and ev.detail:
+            _bump(self.c_rule, ev.detail, s)
+
+    def set_window(self, secs):
+        self.window_secs = secs
+        self._clear_counters()
+        self.win.clear()
+        cut = time.time() - secs
+        for ev in self.events:
+            if ev.ts >= cut:
+                self.win.append(ev)
+                ev.inwin = True
+                self._apply_base(ev, 1)
+                if ev.blocked and ev.resolved:
+                    self._apply_blocked(ev, 1)
+            else:
+                ev.inwin = False
+
+    # -- ingestion -------------------------------------------------------- #
+    def pump(self, budget=0.08):
+        t0, n = time.monotonic(), 0
+        while True:
+            try:
+                line, hint = self.q.get_nowait()
+            except queue.Empty:
+                break
+            self.ingest(line, hint)
+            n += 1
+            if n & 63 == 0 and time.monotonic() - t0 > budget:
+                break
+        self._resolve_pending()
+        self._expire()
+        if time.monotonic() - self._last_prune > 15:
+            self._prune_index()
+
+    def ingest(self, line, hint):
+        if not line:
+            return
+        m = self.access_re.search(line) if '"' in line else None
+        if m:
+            self._on_access(m.groupdict())
+            return
+        me = ERROR_RE.match(line)
+        if me:
+            self._on_error(line, me, hint)
+            return
+        self.unparsed += 1
+
+    def _on_access(self, g):
+        try:
+            status = int(g["status"])
+        except (ValueError, KeyError, TypeError):
+            return
+        method = g.get("method")
+        if method:
+            path = g.get("path") or ""
+        else:
+            parts = (g.get("req") or "").split(" ", 2)
+            method, path = (parts[0], parts[1]) if len(parts) >= 2 else ("-", g.get("req") or "")
+        size = g.get("size")
+        ts = parse_clf(g["time"]) if g.get("time") else time.time()
+        if ts < time.time() - RETENTION:
+            return
+        if not self.keep_internal and (g.get("ua") == "bwapi" or g.get("host") == "bwapi"):
+            return                      # health-checks internes de BunkerWeb
+        ev = Ev()
+        ev.ts, ev.ip, ev.status = ts, g["ip"], status
+        ev.method, ev.path = clean(method, 8), clean(path, 300)
+        ev.size = int(size) if size and size.isdigit() else 0
+        ev.ua = clean(g.get("ua") or "", 120)
+        ev.host = clean((g.get("host") or "").lower(), 80)
+        if ev.host:
+            self.seen_host = True
+        ev.blocked = status in self.block_status
+        ev.reason = ev.detail = ""
+        ev.resolved = not ev.blocked
+        ev.arr = time.monotonic()
+        ev.inwin = ts >= time.time() - self.window_secs
+
+        self.seq += 1
+        self.tot_req += 1
+        self.tot_bytes += ev.size
+        self.events.append(ev)
+        b = self.sec.setdefault(int(ts), [0, 0, 0])
+        b[0] += 1
+        b[2] += ev.size
+        if ev.blocked:
+            self.tot_blocked += 1
+            b[1] += 1
+            self.blocked_events.append(ev)
+            self.pending.append(ev)
+        if ev.inwin:
+            self.win.append(ev)
+            self._apply_base(ev, 1)
+
+    def _on_error(self, line, me, hint):
+        r = classify_error(line)
+        if r is None:
+            if self.dump and IP_RE.search(line) and me.group("level") not in ("info", "debug"):
+                self.dump.write(line + "\n")
+                self.dump.flush()
+            return
+        ip, cat, detail, deny, uri = r
+        ts = hint if hint is not None else parse_err_time(me.group("time"))
+        d = self.rindex.get(ip)
+        if d is None:
+            d = self.rindex[ip] = collections.deque(maxlen=40)
+        d.append((ts, cat, detail, deny, uri))
+        if cat == "modsecurity":
+            mid = ID_RE.search(line)
+            rid = mid.group(1) if mid else ""
+            if rid and rid not in ANOMALY_IDS:        # on ne whiteliste jamais la règle de score global
+                mmsg = MSG_RE.search(line)
+                mh = HOST_ERR_RE.search(line) or SERVER_ERR_RE.search(line)
+                host = clean((mh.group(1) if mh else "").strip('"').lower(), 80)
+                self._modsec_hit(ts, host, ip, rid, clean(mmsg.group(1), 90) if mmsg else "", uri, deny)
+
+    def _modsec_hit(self, ts, host, ip, rid, msg, uri, deny):
+        key = (host, rid)
+        h = self.modsec.get(key)
+        if h is None:
+            if len(self.modsec) >= 5000:              # garde-fou mémoire : on jette le plus ancien
+                old = min(self.modsec, key=lambda k: self.modsec[k]["last"])
+                del self.modsec[old]
+            h = self.modsec[key] = {"host": host, "rid": rid, "msg": msg, "count": 0, "deny": 0,
+                                    "first": ts, "last": ts, "uri": uri, "ips": {}}
+        h["count"] += 1
+        if deny:
+            h["deny"] += 1
+        h["last"] = max(h["last"], ts)
+        h["first"] = min(h["first"], ts)
+        if msg:
+            h["msg"] = msg
+        if uri:
+            h["uri"] = uri
+        info = h["ips"].get(ip)
+        if info is None and len(h["ips"]) < 256:       # garde-fou : au plus 256 IP distinctes mémorisées
+            info = h["ips"][ip] = [0, ts, ts, uri]
+        if info is not None:
+            info[0] += 1
+            info[1] = min(info[1], ts)
+            info[2] = max(info[2], ts)
+            if uri:
+                info[3] = uri
+
+    def _resolve(self, ev):
+        cands = []
+        for e in self.rindex.get(ev.ip, ()):
+            if abs(e[0] - ev.ts) <= CORR_WINDOW:
+                cands.append(e)
+        if cands:
+            exact = [c for c in cands if c[4] and c[4] == ev.path]
+            if exact:
+                cands = exact
+            non_mod = [c for c in cands if c[1] != "modsecurity"]
+            if non_mod:
+                ev.reason, ev.detail = non_mod[-1][1], non_mod[-1][2]
+            else:
+                specific = [c[2] for c in cands if c[2] and not c[3]]
+                ev.reason = "modsecurity"
+                ev.detail = specific[0] if specific else cands[-1][2]
+        else:
+            ev.reason = {429: "rate-limit (429)", 444: "dropped (444)"}.get(
+                ev.status, "unknown (%d)" % ev.status)
+        ev.resolved = True
+        if ev.inwin:
+            self._apply_blocked(ev, 1)
+
+    def _resolve_pending(self):
+        now = time.monotonic()
+        while self.pending and now - self.pending[0].arr >= RESOLVE_DELAY:
+            self._resolve(self.pending.popleft())
+
+    def _expire(self):
+        now = time.time()
+        cut = now - self.window_secs
+        while self.win and self.win[0].ts < cut:
+            ev = self.win.popleft()
+            ev.inwin = False
+            self._apply_base(ev, -1)
+            if ev.blocked and ev.resolved:
+                self._apply_blocked(ev, -1)
+        cut = now - RETENTION
+        while self.events and (self.events[0].ts < cut or len(self.events) > MAX_EVENTS):
+            self.events.popleft()
+        while self.blocked_events and self.blocked_events[0].ts < cut:
+            self.blocked_events.popleft()
+        if self.modsec:
+            for k in [k for k, v in self.modsec.items() if v["last"] < cut]:
+                del self.modsec[k]
+        if len(self.sec) > RETENTION + 120:
+            for k in [k for k in self.sec if k < cut]:
+                del self.sec[k]
+
+    def _prune_index(self):
+        self._last_prune = time.monotonic()
+        cut = time.time() - 300
+        for ip in [ip for ip, d in self.rindex.items() if d and d[-1][0] < cut - 86400 * 2]:
+            del self.rindex[ip]
+        if len(self.rindex) > 200_000:
+            self.rindex.clear()
+
+    # -- lecture pour l'UI ------------------------------------------------- #
+    def rates(self, secs=5):
+        base = int(time.time()) - 1
+        r = b = by = 0
+        for s in range(base - secs + 1, base + 1):
+            v = self.sec.get(s)
+            if v:
+                r += v[0]
+                b += v[1]
+                by += v[2]
+        return r / secs, b / secs, by / secs
+
+    def series(self, n, now=None):
+        """Debit moyen (req/s, bloquees/s) par barre, au plus n barres couvrant la fenetre.
+
+        - chaque barre couvre un nombre ENTIER de secondes (pas d'alternance 2 s / 3 s) ;
+        - les barres sont ancrees sur l'horloge (s // pas) : elles defilent, elles ne glissent pas ;
+        - la seconde en cours (incomplete) est exclue ; la derniere barre, partielle, est
+          divisee par le nombre de secondes reellement ecoulees (pas de chute a droite).
+        Retourne (req, blk, pas_en_secondes).
+        """
+        W = self.window_secs
+        n = max(1, n)
+        step = max(1, -(-W // n))
+        nb = -(-W // step)
+        last = int(time.time() if now is None else now) - 1      # derniere seconde terminee
+        cur_b = last // step
+        first_b = cur_b - nb + 1
+        req, blk = [0.0] * nb, [0.0] * nb
+        for s in range(first_b * step, last + 1):
+            v = self.sec.get(s)
+            if v:
+                i = s // step - first_b
+                req[i] += v[0]
+                blk[i] += v[1]
+        div = [float(step)] * nb
+        div[-1] = float(last - cur_b * step + 1)
+        return [r / d for r, d in zip(req, div)], [b / d for b, d in zip(blk, div)], step
+
+    def span(self):
+        if self.win:
+            return max(1.0, min(self.window_secs, time.time() - self.win[0].ts))
+        return float(self.window_secs)
+
+    def reason_of(self, ev):
+        if not ev.blocked:
+            return ""
+        if not ev.resolved:
+            return "..."
+        return ev.reason + (": " + ev.detail if ev.detail else "")
+
+
+# --------------------------------------------------------------------------- #
+#  Sources de logs (threads)
+# --------------------------------------------------------------------------- #
+
+def last_lines(path, n):
+    with open(path, "rb") as f:
+        f.seek(0, 2)
+        pos, data = f.tell(), b""
+        while pos > 0 and data.count(b"\n") <= n:
+            step = min(65536, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step) + data
+        lines = data.split(b"\n")
+        if pos > 0:
+            lines = lines[1:]
+        return [l.decode("utf-8", "replace") for l in lines[-n:] if l]
+
+
+def tail_file(path, q, backlog, notes, stop):
+    key = os.path.basename(path)
+    first = True
+    f, ino = None, None
+    while not stop.is_set():
+        try:
+            if first and backlog > 0:
+                for l in last_lines(path, backlog):
+                    q.put((l, None))
+            f = open(path, "r", encoding="utf-8", errors="replace")
+            ino = os.fstat(f.fileno()).st_ino
+            if first:
+                f.seek(0, 2)
+            notes[key] = None
+            break
+        except OSError as e:
+            notes[key] = "%s: %s" % (path, e.strerror)
+            time.sleep(2)
+    first = False
+    buf = ""
+    while not stop.is_set():
+        chunk = f.readline()
+        if chunk:
+            buf += chunk
+            if buf.endswith("\n"):
+                q.put((buf.rstrip("\r\n"), None))
+                buf = ""
+            continue
+        time.sleep(0.2)
+        try:
+            st = os.stat(path)
+            if st.st_ino != ino or st.st_size < f.tell():     # rotation / truncate
+                for rest in f:                                # on vide l'ancien fichier d'abord
+                    buf += rest
+                    if buf.endswith("\n"):
+                        q.put((buf.rstrip("\r\n"), None))
+                        buf = ""
+                f.close()
+                f = open(path, "r", encoding="utf-8", errors="replace")
+                ino = os.fstat(f.fileno()).st_ino
+                buf = ""
+        except OSError:
+            pass
+
+
+_procs = []
+
+
+def docker_follow(container, q, backlog, notes, stop):
+    while not stop.is_set():
+        cmd = ["docker", "logs", "-t", "-f", "--tail", str(backlog), container]
+        try:
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 text=True, errors="replace", bufsize=1)
+        except OSError as e:
+            notes["docker"] = "docker: %s" % e.strerror
+            return
+        _procs.append(p)
+        notes["docker"] = None
+        for line in p.stdout:
+            line = line.rstrip("\r\n")
+            m = DOCKER_TS_RE.match(line)
+            hint = None
+            if m:
+                hint = float(calendar.timegm(tuple(int(x) for x in m.groups())))
+                line = line[m.end():]
+            q.put((line, hint))
+        p.wait()
+        notes["docker"] = "docker logs terminé (code %s), nouvelle tentative..." % p.returncode
+        time.sleep(3)
+
+
+def stdin_follow(pipe, q, stop):
+    for line in pipe:
+        if stop.is_set():
+            break
+        q.put((line.rstrip("\r\n"), None))
+
+
+# --------------------------------------------------------------------------- #
+#  Mode demo (trafic synthetique)
+# --------------------------------------------------------------------------- #
+
+def demo_feed(q, stop):
+    rnd = random.Random()
+    good = ["%d.%d.%d.%d" % (rnd.choice((82, 90, 78, 176, 51)), rnd.randint(1, 250),
+                             rnd.randint(1, 250), rnd.randint(1, 250)) for _ in range(250)]
+    bad = ["%d.%d.%d.%d" % (rnd.choice((45, 185, 193, 103, 141)), rnd.randint(1, 250),
+                            rnd.randint(1, 250), rnd.randint(1, 250)) for _ in range(18)]
+    good += ["2a01:e0a:%x:%x:%x:%x:%x:%x" % tuple(rnd.getrandbits(16) for _ in range(6)) for _ in range(30)]
+    bad += ["2a03:2880:f0%02x:%x::%x" % (rnd.randint(0, 99), rnd.getrandbits(16), rnd.getrandbits(16)),
+            "2001:41d0:304:%x:%x:%x:%x:%x" % tuple(rnd.getrandbits(16) for _ in range(5))]
+    hosts = ["www.example.com", "api.example.com", "shop.example.org"]
+    pages = ["/", "/index.html", "/products", "/products/42", "/cart", "/login", "/api/v1/items",
+             "/static/app.js", "/static/style.css", "/img/logo.png", "/blog/hello-world"]
+    uas = ["Mozilla/5.0 (X11; Linux x86_64) Firefox/126.0",
+           "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/125.0 Safari/537.36",
+           "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) Safari/604.1", "curl/8.5.0"]
+    bad_uas = ["sqlmap/1.7", "Nikto/2.5", "python-requests/2.31", "masscan/1.3", "Go-http-client/1.1"]
+    attacks = [
+        ("modsecurity", "942100", "SQL Injection Attack Detected via libinjection", "/index.php?id=1%27%20OR%201=1--"),
+        ("modsecurity", "941100", "XSS Attack Detected via libinjection", "/search?q=%3Cscript%3Ealert(1)%3C/script%3E"),
+        ("modsecurity", "930100", "Path Traversal Attack (/../)", "/download?file=../../../../etc/passwd"),
+        ("modsecurity", "913100", "Found User-Agent associated with security scanner", "/"),
+        ("modsecurity", "932160", "Remote Command Execution: Unix Shell Code Found", "/cgi-bin/x?cmd=;cat%20/etc/shadow"),
+        ("blacklist", "", "", "/"),
+        ("bad-behavior", "", "", "/wp-login.php"),
+        ("bad-behavior", "", "", "/.env"),
+        ("rate-limit", "", "", "/login"),
+        ("antibot", "", "", "/"),
+        ("country", "", "", "/"),
+    ]
+    t0 = time.time()
+    burst_until, burst_ip = 0, None
+    while not stop.is_set():
+        now = time.time()
+        rate = 55 + 35 * __import__("math").sin((now - t0) / 25.0)
+        if now > burst_until and rnd.random() < 0.01:
+            burst_until, burst_ip = now + rnd.uniform(6, 15), rnd.choice(bad)
+        n = max(0, int(rnd.gauss(rate * 0.1, 2)))
+        for _ in range(n):
+            h = rnd.choice(hosts)
+            attack = rnd.random() < 0.09 or (now < burst_until and rnd.random() < 0.35)
+            local = time.strftime("%d/%b/%Y:%H:%M:%S %z", time.localtime(now))
+            errt = time.strftime("%Y/%m/%d %H:%M:%S", time.localtime(now))
+            if attack:
+                ip = burst_ip if (now < burst_until and rnd.random() < 0.7) else rnd.choice(bad)
+                cat, rid, msg, uri = rnd.choice(attacks)
+                ua = rnd.choice(bad_uas)
+                tail = ', client: %s, server: %s, request: "GET %s HTTP/1.1", host: "%s"' % (ip, h, uri, h)
+                if cat == "modsecurity":
+                    q.put(('%s [warn] 12#12: *%d ModSecurity: Warning. detected. [file "x.conf"] [line "46"] '
+                           '[id "%s"] [rev ""] [msg "%s"] [severity "2"] [hostname "10.0.0.5"] [uri "%s"] '
+                           '[unique_id "abc"]%s' % (errt, rnd.randint(1, 9999), rid, msg, uri.split("?")[0], tail), None))
+                    q.put(('%s [error] 12#12: *%d [client %s] ModSecurity: Access denied with code 403 (phase 2). '
+                           'Matched "Operator Ge" [file "y.conf"] [id "949110"] [msg "Inbound Anomaly Score Exceeded '
+                           '(Total Score: 10)"] [uri "%s"]%s' % (errt, rnd.randint(1, 9999), ip, uri.split("?")[0], tail), None))
+                    st = 403
+                elif cat == "rate-limit":
+                    q.put(('%s [error] 12#12: *%d limiting requests, excess: 10.500 by zone "limit"%s'
+                           % (errt, rnd.randint(1, 9999), tail), None))
+                    st = 429
+                else:
+                    q.put(('%s [warn] 12#12: *%d [bunkerweb] %s: IP %s is blocked%s'
+                           % (errt, rnd.randint(1, 9999), cat, ip, tail), None))
+                    st = 444 if cat == "bad-behavior" and rnd.random() < 0.3 else 403
+                q.put(('%s %s - %032x - [%s] "GET %s HTTP/1.1" %d %d "-" "%s"' % (h, ip, rnd.getrandbits(128), local, uri, st, rnd.randint(150, 600), ua), None))
+            else:
+                ip = rnd.choice(good)
+                st = rnd.choices((200, 304, 301, 404, 500, 502), (80, 8, 3, 6, 1.2, 0.8))[0]
+                q.put(('%s %s - %032x - [%s] "%s %s HTTP/1.1" %d %d "-" "%s"' % (
+                    h, ip, rnd.getrandbits(128), local, rnd.choices(("GET", "POST", "HEAD"), (85, 12, 3))[0],
+                    rnd.choice(pages), st, int(rnd.expovariate(1 / 12000)) + 200, rnd.choice(uas)), None))
+        time.sleep(0.1)
+
+
+# --------------------------------------------------------------------------- #
+#  Bans BunkerWeb (API interne de l'instance, celle qu'utilise bwcli)
+# --------------------------------------------------------------------------- #
+
+# Meme ordre que bwcli : les fichiers de l'operateur d'abord, le fichier genere ensuite.
+VARIABLES_FILES = ("/etc/bunkerweb/variables.env", "/etc/bunkerweb/scheduler.env", "/etc/nginx/variables.env")
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
+
+
+def read_env_files(paths=VARIABLES_FILES):
+    out, read = {}, []
+    for p in paths:
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k.startswith("export "):
+                        k = k[7:].strip()
+                    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+                        v = v[1:-1]
+                    out.setdefault(k, v)
+            read.append(p)
+        except OSError:
+            pass
+    return out, read
+
+
+class BanError(Exception):
+    pass
+
+
+class BanClient:
+    """Client HTTP minimal (stdlib) pour l'API des bans.
+
+    kind="instance" : API interne de l'instance BunkerWeb (GET /bans, POST /unban), Host: bwapi.
+    kind="central"  : service bunkerweb-api (GET /bans, POST /bans/unban).
+    """
+
+    def __init__(self, url, host="bwapi", token=None, kind="instance", timeout=4.0, insecure=False):
+        import ssl
+        import urllib.request
+        self.url = url.rstrip("/")
+        self.host, self.token, self.kind, self.timeout = host, token, kind, timeout
+        handlers = [urllib.request.ProxyHandler({})]          # jamais via http_proxy
+        if self.url.startswith("https://"):
+            ctx = ssl.create_default_context()
+            if insecure:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            handlers.append(urllib.request.HTTPSHandler(context=ctx))
+        self.opener = urllib.request.build_opener(*handlers)
+
+    def label(self):
+        return "%s (%s)" % (self.url, "API instance" if self.kind == "instance" else "bunkerweb-api")
+
+    def _req(self, method, path, body=None):
+        import json
+        import urllib.error
+        import urllib.request
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(self.url + path, data=data, method=method)
+        req.add_header("User-Agent", "bwtop/" + VERSION)
+        req.add_header("Accept", "application/json")
+        if self.host:
+            req.add_header("Host", self.host)
+        if self.token:
+            req.add_header("Authorization", "Bearer " + self.token)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with self.opener.open(req, timeout=self.timeout) as r:
+                raw = r.read()
+                code = r.status
+        except urllib.error.HTTPError as e:
+            raw, code = e.read(), e.code
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            raise BanError("%s injoignable : %s" % (self.url, getattr(reason, "strerror", None) or reason))
+        except OSError as e:
+            raise BanError("%s : %s" % (self.url, e))
+        try:
+            js = json.loads(raw.decode("utf-8", "replace")) if raw else {}
+        except ValueError:
+            js = {"msg": raw.decode("utf-8", "replace")[:200]}
+        if code >= 400:
+            msg = ""
+            if isinstance(js, dict):
+                msg = js.get("msg") or js.get("message") or js.get("detail") or ""
+            hint = ""
+            if code in (401, 403):
+                hint = " (API_TOKEN ou API_WHITELIST_IP ?)"
+            elif code == 404 and self.kind == "instance":
+                hint = " (Host « %s » attendu = API_SERVER_NAME ?)" % self.host
+            raise BanError("HTTP %d %s%s" % (code, str(msg)[:160], hint))
+        return code, js
+
+    def list(self):
+        _, js = self._req("GET", "/bans")
+        rows = []
+        if isinstance(js, list):
+            rows = js
+        elif isinstance(js, dict) and isinstance(js.get("data"), list):
+            rows = js["data"]
+        elif isinstance(js, dict):                      # bunkerweb-api : {instance: {data: [...]}}
+            for v in js.values():
+                if isinstance(v, dict) and isinstance(v.get("data"), list):
+                    rows.extend(v["data"])
+        return normalize_bans(rows)
+
+    def unban(self, ban):
+        body = {"ip": ban["ip"]}
+        if ban["scope"] == "service" and ban["service"]:
+            body["service"] = ban["service"]
+        if self.kind == "instance":
+            body["ban_scope"] = ban["scope"]
+            _, js = self._req("POST", "/unban", body)
+        else:
+            _, js = self._req("POST", "/bans/unban", body)
+        if isinstance(js, dict) and js.get("status") not in (None, "success"):
+            raise BanError(str(js.get("msg") or js.get("message") or js))
+        return True
+
+    def remove_lease(self, ban):
+        """Retire la copie locale d'une decision CrowdSec (POST /remove_lease, BunkerWeb 1.6 recent)."""
+        if self.kind != "instance":
+            raise BanError("retrait de la copie CrowdSec non géré via bunkerweb-api : utilise l'API instance")
+        body = {"ip": ban["ip"], "ban_scope": ban["scope"]}
+        if ban["scope"] == "service" and ban["service"]:
+            body["service"] = ban["service"]
+        try:
+            self._req("POST", "/remove_lease", body)
+        except BanError as e:
+            if "HTTP 404" in str(e):
+                raise BanError("/remove_lease absent (BunkerWeb trop ancien ?) : la copie expirera seule")
+            raise
+        return True
+
+
+class CrowdSecCli:
+    """Decisions CrowdSec via cscli (bwtop tourne en root : cscli a acces a la LAPI locale)."""
+
+    def __init__(self, cmd="cscli"):
+        import shlex
+        self.cmd = shlex.split(cmd) or ["cscli"]
+
+    def label(self):
+        return " ".join(self.cmd)
+
+    def _run(self, args, timeout=30):
+        try:
+            p = subprocess.run(self.cmd + args, capture_output=True, text=True, timeout=timeout)
+        except FileNotFoundError:
+            raise BanError("%s introuvable (option --cscli)" % self.cmd[0])
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise BanError("cscli : %s" % e)
+        out = ANSI_RE.sub("", p.stdout or "")
+        err = ANSI_RE.sub("", p.stderr or "")
+        if p.returncode != 0:
+            lines = [l for l in (err + "\n" + out).splitlines() if l.strip()]
+            raise BanError("cscli (code %d) : %s" % (p.returncode, lines[-1][:160] if lines else ""))
+        return out, err
+
+    def decisions(self, ip):
+        import json
+        out, _ = self._run(["decisions", "list", "-a", "--ip", ip, "-l", "0", "-o", "json"])
+        try:
+            data = json.loads(out.strip() or "null")
+        except ValueError:
+            raise BanError("cscli : sortie JSON illisible")
+        found = []
+        for item in data or []:
+            if not isinstance(item, dict):
+                continue
+            decs = item.get("decisions") if "decisions" in item else [item]
+            for d in decs or []:
+                if isinstance(d, dict):
+                    found.append({"id": d.get("id"), "type": str(d.get("type") or "?"),
+                                  "origin": str(d.get("origin") or "?"), "scenario": str(d.get("scenario") or ""),
+                                  "duration": str(d.get("duration") or "")})
+        return found
+
+    def delete(self, ip):
+        out, err = self._run(["decisions", "delete", "--ip", ip])
+        m = re.search(r"(\d+)\s+decision", out + err)
+        return int(m.group(1)) if m else None
+
+
+class DemoCrowdSec:
+    def __init__(self, demo):
+        self.demo, self.gone = demo, set()
+
+    def label(self):
+        return "cscli simulé"
+
+    def decisions(self, ip):
+        time.sleep(0.4)
+        b = self.demo.bans.get(ip)
+        if ip in self.gone or not b or b.get("kind") != "crowdsec_lease":
+            return []
+        return [{"id": 1, "type": "ban", "origin": "crowdsec", "scenario": "crowdsecurity/http-probing",
+                 "duration": "3h41m"}, {"id": 2, "type": "ban", "origin": "lists", "scenario": "firehol_level1",
+                                        "duration": "22h"}]
+
+    def delete(self, ip):
+        n = len(self.decisions(ip))
+        self.gone.add(ip)
+        return n
+
+
+class BwcliUnban:
+    """Unban via `bwcli unban` (gere aussi le multi-instances), liste via l'API."""
+
+    def __init__(self, lister, prefix=()):
+        self.lister, self.prefix = lister, list(prefix)
+
+    def label(self):
+        return self.lister.label() + " · unban via bwcli"
+
+    def list(self):
+        return self.lister.list()
+
+    def unban(self, ban):
+        cmd = self.prefix + ["bwcli", "unban", ban["ip"]]
+        if ban["scope"] == "service" and ban["service"]:
+            cmd += ["-service", ban["service"]]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise BanError("bwcli : %s" % e)
+        out = ANSI_RE.sub("", (p.stdout or "") + (p.stderr or "")).strip().splitlines()
+        if p.returncode != 0:
+            raise BanError("bwcli (code %d) : %s" % (p.returncode, out[-1] if out else ""))
+        return True
+
+    def remove_lease(self, ban):
+        return self.lister.remove_lease(ban)
+
+
+def normalize_bans(rows):
+    out, seen = [], set()
+    now = time.monotonic()
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("ip"):
+            continue
+        svc = r.get("service")
+        scope = r.get("ban_scope") or ("global" if svc in (None, "", "_", "unknown", "bwcli", "Web UI") else "service")
+        if scope == "global":
+            svc = ""
+        kind = r.get("kind") or "ban"
+        key = (r["ip"], scope, svc, kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            exp = float(r.get("exp") or 0)
+        except (TypeError, ValueError):
+            exp = 0.0
+        try:
+            date = float(r.get("date") or 0)
+        except (TypeError, ValueError):
+            date = 0.0
+        out.append({"ip": str(r["ip"]), "scope": scope, "service": svc or "",
+                    "reason": clean(str(r.get("reason") or "-"), 60), "date": date, "exp": exp,
+                    "permanent": bool(r.get("permanent")) or exp <= 0, "kind": kind,
+                    "country": str(r.get("country") or "")[:4], "at": now})
+    return out
+
+
+class DemoBans:
+    """Bans simules pour --demo : les IPs les plus agressives finissent bannies."""
+
+    def __init__(self, eng):
+        self.eng, self.bans, self.cool = eng, {}, {}
+
+    def label(self):
+        return "simulation (--demo)"
+
+    def list(self):
+        now = time.time()
+        for ip, n in dict(self.eng.c_bip).items():
+            if n >= 3 and ip not in self.bans and self.cool.get(ip, 0) < now:
+                svc = random.choice(("", "", "www.example.com", "shop.example.org"))
+                self.bans[ip] = {"ip": ip, "ban_scope": "service" if svc else "global", "service": svc,
+                                 "reason": random.choice(("bad behavior", "modsecurity", "antibot", "dnsbl")),
+                                 "date": now, "exp": random.choice((3600, 86400, 0)) or 0,
+                                 "permanent": False, "country": random.choice(("RU", "CN", "US", "NL", "BR")),
+                                 "kind": random.choice(("ban",) * 6 + ("crowdsec_lease",))}
+                if self.bans[ip]["exp"] == 0:
+                    self.bans[ip]["permanent"] = True
+        rows = []
+        for b in self.bans.values():
+            r = dict(b)
+            if not r["permanent"]:
+                r["exp"] = max(1, b["exp"] - (now - b["date"]))
+            rows.append(r)
+        return normalize_bans(rows)
+
+    def unban(self, ban):
+        self.bans.pop(ban["ip"], None)
+        self.cool[ban["ip"]] = time.time() + 120
+        return True
+
+    remove_lease = unban
+
+
+class BanManager:
+    def __init__(self, client, interval=5.0, cs=None):
+        self.client, self.interval = client, max(1.0, interval)
+        self.cs = cs
+        self.bans, self.err, self.ok_at = [], None, 0.0
+        self.banned = set()
+        self.loading = True
+        self.last = None
+        self.actions = queue.Queue()
+        self.wake = threading.Event()
+        self.msgs = collections.deque(maxlen=20)        # (monotonic, texte, ok)
+
+    def refresh(self):
+        self.wake.set()
+
+    def unban(self, bans, cs_ips=()):
+        self.actions.put((list(bans), list(cs_ips)))
+        self.wake.set()
+
+    def _say(self, txt, ok):
+        self.msgs.append((time.monotonic(), txt, ok))
+        self.last = (time.monotonic(), txt, ok)
+
+    def _do(self, bans, cs_ips):
+        cs_ok = set()
+        for ip in cs_ips:                           # 1) decisions CrowdSec (comme BunkerWeb : avant la copie locale)
+            try:
+                n = self.cs.delete(ip)
+                left = [d for d in self.cs.decisions(ip) if d["type"] == "ban"]
+                if left:
+                    self._say("✘ %s : %d décision(s) CrowdSec « ban » encore actives (%s)" % (
+                        ip, len(left), ", ".join(sorted({d["origin"] for d in left}))), False)
+                    continue
+                cs_ok.add(ip)
+                self._say("✔ %s : %s décision(s) CrowdSec supprimée(s)" % (ip, "?" if n is None else n), True)
+            except BanError as e:
+                self._say("✘ CrowdSec %s : %s" % (ip, e), False)
+            except Exception as e:
+                self._say("✘ CrowdSec %s : %s" % (ip, e), False)
+        for b in bans:                              # 2) bans BunkerWeb
+            where = "global" if b["scope"] == "global" else "site " + b["service"]
+            try:
+                if b["kind"] == "crowdsec_lease":
+                    if b["ip"] not in cs_ok:
+                        self._say("✘ %s (%s) : copie CrowdSec conservée, décisions non supprimées" % (b["ip"], where),
+                                  False)
+                        continue
+                    self.client.remove_lease(b)
+                    self._say("✔ %s : ban CrowdSec retiré de BunkerWeb (%s)" % (b["ip"], where), True)
+                else:
+                    self.client.unban(b)
+                    self._say("✔ %s débanni (%s)" % (b["ip"], where), True)
+            except BanError as e:
+                self._say("✘ unban %s (%s) : %s" % (b["ip"], where, e), False)
+            except Exception as e:
+                self._say("✘ unban %s : %s" % (b["ip"], e), False)
+
+    def _fetch(self):
+        try:
+            bans = self.client.list()
+            self.bans, self.err, self.ok_at = bans, None, time.monotonic()
+            self.banned = {b["ip"] for b in bans}
+        except BanError as e:
+            self.err = str(e)
+        except Exception as e:                           # ne jamais tuer le thread
+            self.err = "%s: %s" % (type(e).__name__, e)
+        self.loading = False
+
+    def run(self, stop):
+        last = 0.0
+        while not stop.is_set():
+            did = False
+            try:
+                while True:
+                    bans, cs_ips = self.actions.get_nowait()
+                    did = True
+                    self._do(bans, cs_ips)
+            except queue.Empty:
+                pass
+            if did or self.wake.is_set() or time.monotonic() - last >= self.interval:
+                self.wake.clear()
+                self._fetch()
+                last = time.monotonic()
+            self.wake.wait(0.3)
+
+
+# --------------------------------------------------------------------------- #
+#  Exclusions ModSecurity (whitelist de faux positifs, par $host)
+# --------------------------------------------------------------------------- #
+#
+# Deux mecanismes BunkerWeb open source, tous deux reversibles :
+#   * API de controle bunkerweb-api  -> POST /configs type "modsec" : applique
+#     automatiquement par le scheduler (flag custom_configs_changed), 100 % live.
+#   * fichier /etc/bunkerweb/configs/modsec[/<service>]/<nom>.conf (bwtop en root)
+#     ingere par le scheduler sur reload (SIGHUP). On lance donc le reload.
+#
+# Dans les deux cas on ecrit "SecRuleRemoveById <id>;", place APRES le Core Rule
+# Set (type "modsec"), ce qui desactive la regle pour le service vise. Le nom du
+# fichier/config porte le prefixe bwtop_fp_ pour pouvoir les lister et les retirer.
+
+EXCL_PREFIX = "bwtop_fp_"
+MODSEC_DIR = "/etc/bunkerweb/configs/modsec"
+RESERVED_SVC = {"", "global", "unknown", "bwcli", "Web UI", "default server", "_"}
+CUSTOM_CONFIG_DIRS_HINT = ("modsec", "modsec_crs", "http", "server_http", "default_server_http",
+                           "stream", "server_stream")
+
+
+class ConfigError(Exception):
+    pass
+
+
+def sanitize_token(s):
+    return re.sub(r"[^\w-]", "_", s or "")[:200]
+
+
+def excl_name(rid, service):
+    return "%s%s_%s" % (EXCL_PREFIX, rid, sanitize_token(service) or "global")
+
+
+def excl_data(rid, service, msg=""):
+    scope = service or "global"
+    body = ("# bwtop : exclusion de faux positif ModSecurity\n"
+            "# règle %s désactivée pour %s%s\n"
+            "SecRuleRemoveById %s;\n") % (rid, scope, (" — " + msg) if msg else "", rid)
+    return body
+
+
+def parse_excl_rid(name):
+    if not name.startswith(EXCL_PREFIX):
+        return None
+    rest = name[len(EXCL_PREFIX):]
+    m = re.match(r"(\d+)", rest)
+    return m.group(1) if m else None
+
+
+class ApiConfigBackend:
+    """Exclusions via le plan de controle bunkerweb-api (POST/GET/DELETE /configs)."""
+    kind = "api"
+    live_note = "appliqué automatiquement par le scheduler en quelques secondes"
+
+    def __init__(self, transport):
+        self.t = transport              # BanClient (kind "central") : ._req(method, path, body)
+        self._smap = None
+
+    def label(self):
+        return self.t.url + " · bunkerweb-api"
+
+    def _call(self, method, path, body=None):
+        try:
+            return self.t._req(method, path, body)
+        except BanError as e:
+            raise ConfigError(str(e))
+
+    def services(self):
+        if self._smap is None:
+            _, js = self._call("GET", "/services")
+            rows = js.get("services") if isinstance(js, dict) else js
+            ids, amap = set(), {}
+            for s in rows or []:
+                if not isinstance(s, dict):
+                    continue
+                sid = s.get("id") or s.get("name")
+                if not sid:
+                    continue
+                ids.add(sid)
+                amap[sid] = sid
+                for key in ("SERVER_NAME", "server_name", sid + "_SERVER_NAME"):
+                    v = s.get(key)
+                    if isinstance(v, str):
+                        for tok in v.split():
+                            amap.setdefault(tok, sid)
+            self._smap = (ids, amap)
+        return self._smap
+
+    def resolve_service(self, host):
+        try:
+            ids, amap = self.services()
+        except ConfigError:
+            return host, "unknown"
+        if host in amap:
+            return amap[host], "ok"
+        return host, "unmatched"
+
+    def list_services(self):
+        return sorted(self.services()[0])
+
+    def service_modsec(self, service):
+        """True/False si ModSec est activé sur le service, None si indéterminé."""
+        try:
+            _, js = self._call("GET", "/services/%s?full=true&methods=false" % service)
+        except ConfigError:
+            return None
+        conf = js.get("config") if isinstance(js, dict) else None
+        if not isinstance(conf, dict):
+            return None
+        v = conf.get("USE_MODSECURITY")
+        if isinstance(v, dict):
+            v = v.get("value")
+        return (str(v).lower() == "yes") if v is not None else True
+
+    def list_exclusions(self):
+        _, js = self._call("GET", "/configs?type=modsec&with_data=false")
+        items = js if isinstance(js, list) else js.get("configs") or js.get("data") or []
+        out = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            name = it.get("name", "")
+            rid = parse_excl_rid(name)
+            if not rid:
+                continue
+            svc = it.get("service") or it.get("service_id") or "global"
+            out.append({"rid": rid, "service": "" if svc in RESERVED_SVC else svc, "name": name})
+        return out
+
+    def add(self, service, rid, msg="", reload_after=True):
+        body = {"type": "modsec", "name": excl_name(rid, service),
+                "data": excl_data(rid, service, msg), "service": service or "global"}
+        try:
+            self._call("POST", "/configs", body)
+        except ConfigError as e:
+            if "already exists" in str(e).lower():
+                return
+            raise
+
+    def remove(self, excl, reload_after=True):
+        svc = excl["service"] or "global"
+        self._call("DELETE", "/configs/%s/modsec/%s" % (svc, excl["name"]))
+
+    def apply(self):
+        return None             # le scheduler applique tout seul
+
+
+class FileConfigBackend:
+    """Exclusions par fichiers .conf (bwtop en root), ingérées au reload du scheduler."""
+    kind = "file"
+    live_note = "bwtop recharge le scheduler juste après (systemctl reload)"
+
+    def __init__(self, base=MODSEC_DIR, reload_cmd=None, env=None):
+        self.base = base
+        self.reload_cmd = reload_cmd or ["systemctl", "restart", "bunkerweb-scheduler"]
+        self.env = env or {}
+
+    def label(self):
+        return self.base + " · reload: " + " ".join(self.reload_cmd)
+
+    def _path(self, service, rid):
+        name = excl_name(rid, service) + ".conf"
+        return os.path.join(self.base, service, name) if service else os.path.join(self.base, name)
+
+    def _service_map(self):
+        # Carte alias -> service (= identifiant = premier server_name). On lit le SERVER_NAME
+        # global (noms principaux) ET chaque <service>_SERVER_NAME (qui liste les alias), car en
+        # multisite le nom vu dans les logs est souvent un alias absent du SERVER_NAME global.
+        amap, ids = {}, set()
+        for tok in (self.env.get("SERVER_NAME") or "").split():
+            ids.add(tok)
+            amap.setdefault(tok, tok)
+        for key, val in self.env.items():
+            if key.endswith("_SERVER_NAME") and isinstance(val, str):
+                primary = key[:-len("_SERVER_NAME")]
+                toks = val.split()
+                sid = primary if primary in ids or not toks else toks[0]
+                ids.add(sid)
+                for tok in toks:
+                    amap.setdefault(tok, sid)
+        # Dossiers de services déjà présents sous configs/ (source additionnelle fiable)
+        try:
+            parent = os.path.dirname(self.base)
+            for d in CUSTOM_CONFIG_DIRS_HINT:
+                sub = os.path.join(parent, d)
+                if os.path.isdir(sub):
+                    for name in os.listdir(sub):
+                        if os.path.isdir(os.path.join(sub, name)):
+                            ids.add(name)
+                            amap.setdefault(name, name)
+        except OSError:
+            pass
+        return ids, amap
+
+    def resolve_service(self, host):
+        ids, amap = self._service_map()
+        if host in amap:
+            return amap[host], "ok"
+        return host, ("unmatched" if amap else "unknown")
+
+    def list_services(self):
+        return sorted(self._service_map()[0])
+
+    def service_modsec(self, service):
+        v = self.env.get("%s_USE_MODSECURITY" % service) or self.env.get("USE_MODSECURITY") or "yes"
+        return str(v).lower() == "yes"
+
+    def list_exclusions(self):
+        out = []
+        try:
+            for root, _, files in os.walk(self.base):
+                for fn in files:
+                    if not (fn.startswith(EXCL_PREFIX) and fn.endswith(".conf")):
+                        continue
+                    rid = parse_excl_rid(fn[:-5])
+                    if not rid:
+                        continue
+                    svc = "" if os.path.dirname(os.path.join(root, fn)) == self.base else os.path.basename(root)
+                    out.append({"rid": rid, "service": svc, "name": fn[:-5], "path": os.path.join(root, fn)})
+        except OSError as e:
+            raise ConfigError("lecture de %s impossible : %s" % (self.base, e))
+        return out
+
+    def add(self, service, rid, msg="", reload_after=True):
+        path = self._path(service, rid)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(excl_data(rid, service, msg))
+            os.replace(tmp, path)
+        except OSError as e:
+            raise ConfigError("écriture de %s impossible : %s (lancer bwtop en root ?)" % (path, e))
+        if reload_after:
+            self.apply()
+
+    def remove(self, excl, reload_after=True):
+        path = excl.get("path") or self._path(excl["service"], excl["rid"])
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            raise ConfigError("suppression de %s impossible : %s" % (path, e))
+        if reload_after:
+            self.apply()
+
+    def apply(self):
+        try:
+            p = subprocess.run(self.reload_cmd, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise ConfigError("reload du scheduler impossible (%s) : %s — relance-le à la main" % (
+                " ".join(self.reload_cmd), e))
+        if p.returncode != 0:
+            err = ANSI_RE.sub("", (p.stderr or p.stdout or "")).strip().splitlines()
+            raise ConfigError("reload du scheduler a échoué (code %d) : %s" % (
+                p.returncode, err[-1][:160] if err else ""))
+        return None
+
+
+class DemoConfig:
+    kind = "demo"
+    live_note = "simulation (--demo)"
+
+    def __init__(self):
+        self.store = {}
+
+    def label(self):
+        return "simulation (--demo)"
+
+    def resolve_service(self, host):
+        return host, ("ok" if host and "." in host else "unmatched")
+
+    def list_services(self):
+        return ["www.example.com", "shop.example.org"]
+
+    def service_modsec(self, service):
+        return True
+
+    def list_exclusions(self):
+        return list(self.store.values())
+
+    def add(self, service, rid, msg="", reload_after=True):
+        self.store[(service, rid)] = {"rid": rid, "service": service, "name": excl_name(rid, service)}
+
+    def remove(self, excl, reload_after=True):
+        self.store.pop((excl["service"], excl["rid"]), None)
+
+    def apply(self):
+        return None
+
+
+class ConfigManager:
+    """Thread de travail pour les exclusions ModSec (I/O réseau ou reload bloquants)."""
+
+    def __init__(self, backend, interval=20.0):
+        self.backend, self.interval = backend, max(2.0, interval)
+        self.exclusions = []
+        self.keys = set()               # {(service, rid)} actifs
+        self.err = None
+        self.loading = True
+        self.last = None                # (monotonic, texte, ok) : dernière action, affichée en continu
+        self._added = set()             # ajouts à revérifier après reload
+        self._verify_at = 0.0
+        self.actions = queue.Queue()
+        self.wake = threading.Event()
+        self.msgs = collections.deque(maxlen=20)
+
+    def refresh(self):
+        self.wake.set()
+
+    def excluded(self, host, rid):
+        return (host, rid) in self.keys or ("", rid) in self.keys
+
+    def toggle(self, host, rid, msg, scope_global=False):
+        self.actions.put(("toggle", host, rid, msg, scope_global))
+        self.wake.set()
+
+    def _say(self, txt, ok):
+        self.msgs.append((time.monotonic(), txt, ok))
+        self.last = (time.monotonic(), txt, ok)
+
+    def _fetch(self):
+        try:
+            self.exclusions = self.backend.list_exclusions()
+            self.keys = {(e["service"], e["rid"]) for e in self.exclusions}
+            self.err = None
+        except ConfigError as e:
+            self.err = str(e)
+        except Exception as e:
+            self.err = "%s: %s" % (type(e).__name__, e)
+        self.loading = False
+
+    def _do(self, host, rid, msg, scope_global):
+        """Applique une bascule sans recharger (le reload est groupé ensuite). Renvoie True si modifié."""
+        service = "" if scope_global else host
+        existing = next((e for e in self.exclusions if e["rid"] == rid and e["service"] == service), None)
+        label = "globalement" if not service else "pour %s" % service
+        auto = self.backend.kind == "api"      # l'API applique via le scheduler, pas de reload à lancer
+        try:
+            if existing:
+                self.backend.remove(existing, reload_after=False)
+                self._say("✔ règle %s réactivée %s%s" % (
+                    rid, label, " (appliqué par le scheduler)" if auto else ""), True)
+            else:
+                svc, status = (service, "ok")
+                if service:
+                    svc, status = self.backend.resolve_service(host)
+                    service = svc
+                self.backend.add(service, rid, msg, reload_after=False)
+                extra = "" if status != "unmatched" else " [%s inconnu comme service : vérifie le scope]" % host
+                self._say("✔ règle %s désactivée %s%s%s" % (
+                    rid, ("pour %s" % service) if service else "globalement",
+                    " (appliqué par le scheduler)" if auto else "", extra), True)
+                self._added.add((service, rid))        # à revérifier après le reload
+            return True
+        except ConfigError as e:
+            self._say("✘ règle %s : %s" % (rid, e), False)
+        except Exception as e:
+            self._say("✘ règle %s : %s" % (rid, e), False)
+        return False
+
+    def run(self, stop):
+        last = 0.0
+        while not stop.is_set():
+            changed = 0
+            try:
+                while True:
+                    _, host, rid, msg, sg = self.actions.get_nowait()
+                    if self._do(host, rid, msg, sg):
+                        changed += 1
+            except queue.Empty:
+                pass
+            if changed and self.backend.kind != "api":
+                # un seul reload du scheduler, même pour plusieurs whitelists d'affilée
+                try:
+                    self.backend.apply()
+                    self._say("↻ scheduler rechargé — %d modification(s) appliquée(s)" % changed, True)
+                except ConfigError as e:
+                    self._say("✘ fichiers écrits mais reload échoué : %s — relance le scheduler" % e, False)
+                except Exception as e:
+                    self._say("✘ reload du scheduler : %s" % e, False)
+            if changed and self._added:
+                self._verify_at = time.monotonic() + 6.0    # laisser le scheduler traiter
+            if changed or self.wake.is_set() or time.monotonic() - last >= self.interval:
+                self.wake.clear()
+                self._fetch()
+                last = time.monotonic()
+            if self._verify_at and time.monotonic() >= self._verify_at:
+                self._verify_at = 0.0
+                self._fetch()
+                gone = {k for k in self._added if k not in self.keys}
+                self._added = set()
+                if gone:
+                    ex = ", ".join("%s/%s" % (svc or "global", rid) for svc, rid in sorted(gone))
+                    hint = (" Utilise --reload-cmd \"systemctl restart bunkerweb-scheduler\" (reload ne scanne pas les fichiers)."
+                            if "restart" not in " ".join(getattr(self.backend, "reload_cmd", [])) else
+                            " Diagnostique avec : bwtop --selftest.")
+                    self._say("⚠ exclusion disparue après reload (%s) : le scheduler ne l'a pas importée.%s" % (ex, hint), False)
+            self.wake.wait(0.3)
+
+
+
+# --------------------------------------------------------------------------- #
+#  Configuration persistante (colonnes)
+# --------------------------------------------------------------------------- #
+
+# id: (titre, largeur par defaut, min, max)    largeur 0 = auto (IP seulement)
+COLDEF = collections.OrderedDict([
+    ("time",   ("HEURE", 8, 8, 8)),
+    ("ip",     ("IP", 0, 7, 39)),
+    ("code",   ("CODE", 4, 3, 4)),
+    ("reason", ("RAISON", 30, 8, 90)),
+    ("host",   ("SITE", 20, 6, 60)),
+    ("method", ("MÉTH", 5, 4, 8)),
+    ("size",   ("TAILLE", 7, 5, 9)),
+    ("ua",     ("USER-AGENT", 30, 8, 120)),
+    ("url",    ("URL", 40, 10, 300)),
+])
+DEFAULT_ON = {"time", "ip", "code", "reason", "host", "method", "url"}
+
+
+def default_columns():
+    return [{"id": c, "on": c in DEFAULT_ON, "width": d[1]} for c, d in COLDEF.items()]
+
+
+def config_path(override=None):
+    if override:
+        return override, None
+    owner = None
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user and hasattr(os, "geteuid") and os.geteuid() == 0:
+        try:
+            import pwd
+            pw = pwd.getpwnam(sudo_user)
+            return os.path.join(pw.pw_dir, ".config", "bwtop", "config.json"), (pw.pw_uid, pw.pw_gid)
+        except (KeyError, ImportError):
+            pass
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "bwtop", "config.json"), owner
+
+
+def load_config(path):
+    import json
+    cfg = {"columns": default_columns(), "crowdsec_unban": False, "graph_max": None, "setup": 0}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        cols, seen = [], set()
+        for c in data.get("columns", []):
+            cid = c.get("id")
+            if cid in COLDEF and cid not in seen:
+                d = COLDEF[cid]
+                wd = int(c.get("width", d[1]))
+                if not (cid == "ip" and wd == 0):
+                    wd = max(d[2], min(d[3], wd))
+                cols.append({"id": cid, "on": bool(c.get("on")), "width": wd})
+                seen.add(cid)
+        for c in default_columns():                      # colonnes ajoutees dans une version future
+            if c["id"] not in seen:
+                cols.append(c)
+        if cols:
+            cfg["columns"] = cols
+        cfg["crowdsec_unban"] = bool(data.get("crowdsec_unban", False))
+        gm = data.get("graph_max")
+        cfg["graph_max"] = gm if isinstance(gm, (int, float)) and gm > 0 else None
+        cfg["setup"] = int(data.get("setup", 0) or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return cfg
+
+
+def save_config(path, owner, cfg):
+    import json
+    try:
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "setup": int(cfg.get("setup", 0) or 0),
+                       "crowdsec_unban": bool(cfg.get("crowdsec_unban")), "graph_max": cfg.get("graph_max"),
+                       "columns": cfg["columns"]}, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+        if owner:
+            for p in (os.path.dirname(d), d, path):
+                try:
+                    os.chown(p, *owner)
+                except OSError:
+                    pass
+        return None
+    except OSError as e:
+        return str(e)
+
+
+# --------------------------------------------------------------------------- #
+#  Interface curses
+# --------------------------------------------------------------------------- #
+
+C_TITLE, C_OK, C_WARN, C_BAD, C_INFO, C_MAG, C_HDR, C_STACK = range(1, 9)
+SPARK = " ▁▂▃▄▅▆▇█"
+PART = " ▏▎▍▌▋▊▉"
+PALETTE = [C_BAD, C_WARN, C_MAG, C_TITLE, C_INFO, C_OK]
+REASON_COLOR = {"modsecurity": C_MAG, "blacklist": C_BAD, "bad-behavior": C_WARN, "rate-limit": C_TITLE,
+                "antibot": C_INFO, "country": C_INFO, "crowdsec": C_BAD, "dnsbl": C_BAD, "banned": C_BAD}
+BAN_MARK = "●"
+GRAPH_ROWS = 4
+SCALES = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000, 100000]
+
+
+def nice_scale(peak):
+    for v in SCALES:
+        if v >= peak:
+            return v
+    return SCALES[-1]
+ESC = 27
+
+
+def fmt_n(n):
+    n = float(n)
+    for unit in ("", "k", "M", "G"):
+        if abs(n) < 1000 or unit == "G":
+            return ("%d" % n if unit == "" else "%.1f%s" % (n, unit))
+        n /= 1000.0
+
+
+def fmt_b(n):
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024 or unit == "TB":
+            return "%.0f%s" % (n, unit) if unit == "B" else "%.1f%s" % (n, unit)
+        n /= 1024.0
+
+
+def fmt_rate(v):
+    v = float(v)
+    if v >= 1000:
+        return ("%.1fk" % (v / 1000)).replace(".0k", "k")
+    return "%.0f" % v if v >= 10 or v == int(v) else "%.1f" % v
+
+
+def fmt_dur(s):
+    s = int(max(0, s))
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    if d:
+        return "%dj%02dh" % (d, h)
+    if h:
+        return "%dh%02dm" % (h, m)
+    return "%dm%02ds" % (m, s)
+
+
+def elide(s, n, middle=False):
+    """Tronque a n caracteres ; au milieu pour les IP (debut et fin restent lisibles)."""
+    if n <= 0:
+        return ""
+    if len(s) <= n:
+        return s
+    if n == 1:
+        return "…"
+    if middle:
+        a = n // 2
+        b = n - 1 - a
+        return s[:a] + "…" + (s[-b:] if b else "")
+    return s[:n - 1] + "…"
+
+
+def hbar(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    full, part = divmod(int(round(frac * width * 8)), 8)
+    return "█" * full + (PART[part] if part and full < width else "")
+
+
+class UI:
+    MID_VIEWS = [("Top IPs bloquées", "c_bip"), ("Top clients (tous)", "c_ip")]
+    RIGHT_VIEWS = [("URLs ciblées (bloquées)", "c_burl"), ("Règles ModSecurity", "c_rule"),
+                   ("User-Agents (bloqués)", "c_bua"), ("Méthodes HTTP", "c_method"),
+                   ("Sites (requêtes)", "c_host"), ("Sites (bloquées)", "c_bhost")]
+    BAN_SORTS = [("date", "plus récents"), ("hits", "requêtes bloquées"), ("remaining", "temps restant"),
+                 ("ip", "IP")]
+
+    def __init__(self, scr, eng, source_label, color=True, bans=None, cfg=None, cfg_path=None, cfg_owner=None, configmgr=None):
+        self.s, self.e, self.source = scr, eng, source_label
+        self.bm = bans
+        self.cm = configmgr
+        self.cfg = cfg or {"columns": default_columns()}
+        self.cfg_path, self.cfg_owner = cfg_path, cfg_owner
+        self.view = "dash"
+        self.win_idx = 1
+        self.paused = False
+        self.blocked_only = False
+        self.mid_view = 0
+        self.right_view = 0
+        self.scroll = 0
+        self.anchor = 0
+        self.modal = None              # None | "help" | "cols" | ("confirm", [bans], texte) | ("info", texte) | ("filter", buf)
+        self.col_cur = 0
+        self.ban_cur = 0
+        self.ban_top = 0
+        self.ban_sort = 0
+        self.ban_filter = ""
+        self.ban_rows = []
+        self.ms_cur = 0
+        self.ms_top = 0
+        self.ms_sort = 0
+        self.ms_filter = ""
+        self.ms_rows = []
+        self.msd_top = 0
+        self.flash = None              # (monotonic, texte, ok)
+        self.cs_on = bool(self.cfg.get("crowdsec_unban")) and bans is not None and bans.cs is not None
+        self.cs_prev = {}              # ip -> ("loading"|"ok"|"err", decisions|message)
+        self.gmax = self.cfg.get("graph_max")   # echelle fixe du graphe (req/s) ; None = a calibrer
+        self.t0 = time.monotonic()
+        self._ipw = (15, 0.0)
+        self.attr = {}
+        curses.curs_set(0)
+        if color and curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                bg = -1
+            except curses.error:
+                bg = curses.COLOR_BLACK
+            for n, fg in ((C_TITLE, curses.COLOR_CYAN), (C_OK, curses.COLOR_GREEN),
+                          (C_WARN, curses.COLOR_YELLOW), (C_BAD, curses.COLOR_RED),
+                          (C_INFO, curses.COLOR_BLUE), (C_MAG, curses.COLOR_MAGENTA)):
+                curses.init_pair(n, fg, bg)
+            curses.init_pair(C_HDR, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(C_STACK, curses.COLOR_RED, curses.COLOR_GREEN)   # frontiere bloquees/autorisees
+            for n in range(1, 9):
+                self.attr[n] = curses.color_pair(n)
+        else:
+            for n in range(1, 9):
+                self.attr[n] = curses.A_REVERSE if n == C_HDR else 0
+        self.border = curses.A_DIM
+        self.e.set_window(WINDOWS[self.win_idx][1])
+
+    # -- primitives ---------------------------------------------------------
+    def put(self, y, x, text, attr=0, maxw=None):
+        h, w = self.s.getmaxyx()
+        if y < 0 or y >= h or x >= w or x < 0:
+            return
+        maxw = (w - x) if maxw is None else min(maxw, w - x)
+        if maxw <= 0:
+            return
+        try:
+            self.s.addstr(y, x, text[:maxw], attr)
+        except curses.error:
+            pass
+
+    def box(self, y, x, h, w, title="", right=""):
+        if h < 3 or w < 6:
+            return
+        b = self.border
+        self.put(y, x, "╭" + "─" * (w - 2) + "╮", b)
+        for i in range(1, h - 1):
+            self.put(y + i, x, "│", b)
+            self.put(y + i, x + w - 1, "│", b)
+        self.put(y + h - 1, x, "╰" + "─" * (w - 2) + "╯", b)
+        if title:
+            self.put(y, x + 2, "┤", b)
+            self.put(y, x + 3, " %s " % title, self.attr[C_TITLE] | curses.A_BOLD, w - 6)
+            self.put(y, x + 5 + len(title), "├", b)
+        if right:
+            self.put(y, x + w - len(right) - 3, " %s " % right, curses.A_DIM)
+
+    def clear_rect(self, y, x, h, w):
+        for i in range(h):
+            self.put(y + i, x, " " * w)
+
+    def banned(self, ip):
+        return self.bm is not None and ip in self.bm.banned
+
+    def ranked(self, y, x, h, w, title, items, colors=None, right="", is_ip=False):
+        self.box(y, x, h, w, title, right)
+        iw, rows = w - 4, h - 2
+        if not items:
+            self.put(y + 1, x + 2, "(aucune donnée)", curses.A_DIM)
+            return
+        shown = items[:rows]
+        rw = 6
+        mw = 2 if is_ip and self.bm is not None else 0
+        maxlab = max(len(str(k)) for k, _ in shown)
+        bw = 8 if iw >= 34 else 0
+        lw = iw - rw - mw - (bw + 1 if bw else 0) - 1
+        if bw and maxlab > lw:                         # IPv6 : on sacrifie la barre plutot que l'adresse
+            bw = 0
+            lw = iw - rw - mw - 1
+        mx = max(v for _, v in shown) or 1
+        for i, (k, v) in enumerate(shown):
+            col = colors(k, i) if colors else PALETTE[i % len(PALETTE)]
+            yy = y + 1 + i
+            xx = x + 2
+            if mw:
+                if self.banned(k):
+                    self.put(yy, xx, BAN_MARK, self.attr[C_BAD] | curses.A_BOLD)
+                xx += mw
+            self.put(yy, xx, elide(str(k), lw, middle=is_ip).ljust(lw), 0, lw)
+            xx += lw + 1
+            if bw:
+                self.put(yy, xx, hbar(v / mx, bw).ljust(bw), self.attr[col], bw)
+                xx += bw + 1
+            self.put(yy, xx, fmt_n(v).rjust(rw), curses.A_BOLD, rw)
+
+    # -- ecran ---------------------------------------------------------------
+    def draw(self):
+        s = self.s
+        s.erase()
+        h, w = s.getmaxyx()
+        if h < 18 or w < 80:
+            self.put(0, 0, "Terminal trop petit (min 80x18) - actuel %dx%d" % (w, h))
+            s.refresh()
+            return
+        self.draw_header(w)
+        if self.view == "bans":
+            self.draw_bans(1, h - 2, w)
+        elif self.view == "modsec":
+            self.draw_modsec(1, h - 2, w)
+        else:
+            self.draw_dash(h, w)
+        self.draw_footer(h, w)
+        m = self.modal
+        if m == "help":
+            self.draw_help(h, w)
+        elif m == "cols":
+            self.draw_cols(h, w)
+        elif isinstance(m, tuple) and m[0] in ("confirm", "info", "fpconfirm"):
+            self.draw_dialog(h, w)
+        elif isinstance(m, tuple) and m[0] == "msdetail":
+            self.draw_msdetail(h, w)
+        s.refresh()
+
+    def draw_header(self, w):
+        tabs = [("1", "Dashboard", "dash"), ("2", "Bans", "bans"), ("3", "ModSec", "modsec")]
+        self.put(0, 0, " " * w, self.attr[C_HDR])
+        x = 0
+        t = " bwtop %s │" % VERSION
+        self.put(0, x, t, self.attr[C_HDR] | curses.A_BOLD)
+        x += len(t)
+        for key, name, v in tabs:
+            if v == "bans" and self.bm is not None:
+                name += " (%d)" % len(self.bm.bans) if not self.bm.err else " (!)"
+            if v == "modsec":
+                name += " (%d)" % len(self.e.modsec) if self.e.modsec else ""
+            lab = " %s %s " % (key, name)
+            a = self.attr[C_HDR] | (curses.A_BOLD | curses.A_REVERSE if self.view == v else 0)
+            self.put(0, x, lab, a)
+            x += len(lab)
+        t = "│ %s │ fenêtre " % self.source
+        self.put(0, x, t, self.attr[C_HDR])
+        x += len(t)
+        for i, (n, _) in enumerate(WINDOWS):
+            t = "[%s]" % n if i == self.win_idx else " %s " % n
+            self.put(0, x, t, self.attr[C_HDR] | (curses.A_BOLD if i == self.win_idx else 0))
+            x += len(t)
+        clock = datetime.now().strftime("%H:%M:%S")
+        tail = ("  PAUSE  " if self.paused else "") + clock + " "
+        self.put(0, max(x + 1, w - len(tail)), tail, self.attr[C_HDR] | curses.A_BOLD)
+
+    def draw_footer(self, h, w):
+        e = self.e
+        now = time.monotonic()
+        msg = None
+        if self.bm is not None and self.bm.msgs:
+            t, txt, ok = self.bm.msgs[-1]
+            if now - t < 8:
+                msg = (txt, ok)
+        if msg is None and self.cm is not None and self.cm.msgs:
+            t, txt, mok = self.cm.msgs[-1]
+            if now - t < 8:
+                msg = (txt, mok)
+        if msg is None and self.flash and now - self.flash[0] < 5:
+            msg = (self.flash[1], self.flash[2])
+        if msg:
+            self.put(h - 1, 0, (" " + msg[0]).ljust(w - 1), self.attr[C_OK if msg[1] else C_BAD] | curses.A_BOLD)
+            return
+        if isinstance(self.modal, tuple) and self.modal[0] == "filter":
+            lab = "Filtre bans (IP, site, raison)" if self.view == "bans" else "Filtre ModSec (host, règle, msg)"
+            self.put(h - 1, 0, (" %s : %s▏" % (lab, self.modal[1])).ljust(w - 1), self.attr[C_TITLE] | curses.A_BOLD)
+            return
+        if self.view == "modsec":
+            act = "activer" if self.cm is not None else "indispo"
+            keys = (" ↑↓ choisir  Entrée IP+horodatage  w whitelister/réactiver (%s)  g global  / filtrer"
+                    "  s tri  r rafraîchir  Tab dashboard  h aide  q quitter" % act)
+            self.put(h - 1, 0, keys.ljust(w - 1), curses.A_DIM)
+            return
+        if self.view == "bans":
+            keys = (" ↑↓ choisir  u débannir  U débannir l'IP partout  C CrowdSec %s  / filtrer  s tri"
+                    "  r rafraîchir  Tab/1 dashboard  h aide  q quitter" % ("ON→off" if self.cs_on else "off→ON"))
+            self.put(h - 1, 0, keys.ljust(w - 1), curses.A_DIM)
+            return
+        keys = (" q quitter  Tab/2 bans  c colonnes  +/- échelle  p pause  w fenêtre  b bloquées seules"
+                "  i/v panneaux  r reset  ↑↓ défiler  h aide")
+        note = " ".join(str(v) for v in e.notes.values() if v)
+        self.put(h - 1, 0, (note or keys).ljust(w - 1), self.attr[C_WARN] if note else curses.A_DIM)
+
+    def draw_dash(self, h, w):
+        e = self.e
+        wname, _ = WINDOWS[self.win_idx]
+        avail = h - 2
+        top_h = 8
+        mid_h = 8 if avail >= 30 else 6
+        feed_h = avail - top_h - mid_h
+        if feed_h < 5:
+            mid_h = 0
+            feed_h = avail - top_h
+        y = 1
+
+        # ---- trafic --------------------------------------------------------
+        tw = max(44, int(w * 0.62))
+        gw = max(10, tw - 4 - 7)
+        rq, bl, step = e.series(gw)
+        self.box(y, 0, top_h, tw, "Trafic HTTP", "fenêtre %s · 1 barre = %s" % (
+            wname, "%d s" % step if step < 60 else "%d min %02d s" % divmod(step, 60)))
+        iw = tw - 4
+        rps, brps, bps = e.rates()
+        span = e.span()
+        avg = e.w_total / span
+        pct = 100.0 * e.w_blocked / e.w_total if e.w_total else 0.0
+        self.put(y + 1, 2, "req/s ", curses.A_DIM)
+        self.put(y + 1, 8, "%7.1f" % rps, self.attr[C_OK] | curses.A_BOLD)
+        self.put(y + 1, 15, "  moy %.1f   total %s   débit %s/s" % (avg, fmt_n(e.tot_req), fmt_b(bps)))
+        self.put(y + 2, 2, "bloquées", curses.A_DIM)
+        self.put(y + 2, 11, "%s" % fmt_n(e.w_blocked), self.attr[C_BAD] | curses.A_BOLD)
+        line = "  (%.1f%%)  %.2f/s   clients uniques %s" % (pct, brps, fmt_n(len(e.c_ip)))
+        if self.bm is not None:
+            line += "   bans actifs %s" % ("?" if self.bm.err or self.bm.loading else len(self.bm.bans))
+        self.put(y + 2, 11 + len(fmt_n(e.w_blocked)), line, 0, iw - 10 - len(fmt_n(e.w_blocked)))
+        self.draw_graph(y + 3, 2, gw, rq, bl)
+        peak = max(rq) if rq else 0
+        legend = [("█", self.attr[C_OK]), (" autorisées  ", curses.A_DIM), ("█", self.attr[C_BAD]),
+                  (" bloquées  ", curses.A_DIM), ("▲", self.attr[C_WARN] | curses.A_BOLD),
+                  (" hors échelle  ", curses.A_DIM), ("pic %s/s · échelle +/-" % fmt_rate(peak), curses.A_DIM)]
+        lx = 3
+        for txt, a in legend:
+            self.put(y + top_h - 1, lx, txt, a, tw - 2 - lx)
+            lx += len(txt)
+
+        # ---- codes HTTP ----------------------------------------------------
+        sx = tw
+        sw = w - tw
+        self.box(y, sx, top_h, sw, "Codes HTTP")
+        tot = max(e.w_total, 1)
+        rowsdef = [("2xx", e.c_cls.get(2, 0), C_OK), ("3xx", e.c_cls.get(3, 0), C_INFO),
+                   ("4xx", e.c_cls.get(4, 0), C_WARN), ("5xx", e.c_cls.get(5, 0), C_BAD),
+                   ("blk", e.w_blocked, C_MAG)]
+        bw = max(4, sw - 4 - 4 - 7 - 7)
+        for i, (lab, v, col) in enumerate(rowsdef):
+            yy = y + 1 + i
+            self.put(yy, sx + 2, lab, curses.A_DIM)
+            self.put(yy, sx + 6, hbar(v / tot, bw).ljust(bw), self.attr[col], bw)
+            self.put(yy, sx + 6 + bw + 1, fmt_n(v).rjust(6), curses.A_BOLD)
+        bs = "  ".join("%d×%s" % (k, fmt_n(v)) for k, v in sorted(e.c_bstatus.items()))
+        self.put(y + 6, sx + 2, ("blk: " + bs) if bs else "blk: -", curses.A_DIM, sw - 4)
+        y += top_h
+
+        # ---- panneaux du milieu -------------------------------------------
+        if mid_h:
+            w1 = w // 3
+            w2 = w // 3
+            w3 = w - w1 - w2
+            rows = mid_h - 2
+            self.ranked(y, 0, mid_h, w1, "Raisons de blocage", top(e.c_reason, rows),
+                        colors=lambda k, i: REASON_COLOR.get(k, C_WARN if "unknown" in k else PALETTE[i % 6]),
+                        right="%d types" % len(e.c_reason))
+            t2, a2 = self.MID_VIEWS[self.mid_view]
+            right2 = "%s bannie [i]" % BAN_MARK if self.bm is not None else "[i]"
+            self.ranked(y, w1, mid_h, w2, t2, top(getattr(e, a2), rows),
+                        colors=lambda k, i: C_BAD if a2 == "c_bip" else C_OK, right=right2, is_ip=True)
+            t3, a3 = self.RIGHT_VIEWS[self.right_view]
+            self.ranked(y, w1 + w2, mid_h, w3, t3, top(getattr(e, a3), rows),
+                        colors=lambda k, i: C_MAG if a3 == "c_rule" else C_TITLE, right="[v]")
+            y += mid_h
+
+        self.draw_feed(y, feed_h, w)
+
+    def draw_graph(self, y, x, gw, rq, bl):
+        """Barres empilees sur GRAPH_ROWS lignes : bloquees (rouge) en bas, autorisees (vert) au-dessus."""
+        if self.gmax is None:                          # calibrage unique au demarrage, puis echelle figee
+            if time.monotonic() - self.t0 < 2.0:
+                self.put(y + 1, x + 8, "calibrage de l'échelle…", curses.A_DIM)
+                return
+            self.gmax = nice_scale(max(rq + [0.0]) * 1.25 or 1)
+        gm = float(self.gmax)
+        units = GRAPH_ROWS * 8
+        labels = {0: fmt_rate(gm), GRAPH_ROWS // 2: fmt_rate(gm / 2), GRAPH_ROWS - 1: "0"}
+        for r in range(GRAPH_ROWS):
+            self.put(y + r, x, labels.get(r, "").rjust(5), curses.A_DIM)
+            self.put(y + r, x + 5, "┤" if r in labels else "│", curses.A_DIM)
+        bx = x + 7
+        off = max(0, gw - len(rq))                     # plus recent a droite
+        for i, (r, b) in enumerate(zip(rq[-gw:], bl[-gw:])):
+            if r <= 0:
+                continue
+            tu = max(1, int(round(min(r, gm) / gm * units)))
+            bu = int(round(min(b, r, gm) / gm * units))
+            if b > 0:
+                bu = max(1, min(bu, tu))
+            clipped = r > gm
+            cx = bx + off + i
+            for row in range(GRAPH_ROWS):             # row 0 = bas
+                fill = max(0, min(8, tu - row * 8))
+                if not fill:
+                    break
+                red = max(0, min(8, bu - row * 8))
+                if red >= fill:                        # case entierement bloquee
+                    ch, a = SPARK[fill], self.attr[C_BAD]
+                elif red == 0:                         # case entierement autorisee
+                    ch, a = SPARK[fill], self.attr[C_OK]
+                elif fill == 8:                        # frontiere : bas rouge, haut vert (fond)
+                    ch, a = SPARK[red], self.attr[C_STACK]
+                else:                                  # sommet partiel mixte : couleur majoritaire
+                    ch, a = SPARK[fill], self.attr[C_BAD] if red * 2 >= fill else self.attr[C_OK]
+                if clipped and row == GRAPH_ROWS - 1:
+                    ch, a = "▲", self.attr[C_WARN] | curses.A_BOLD
+                self.put(y + GRAPH_ROWS - 1 - row, cx, ch, a, 1)
+
+    def set_scale(self, d):
+        cur = self.gmax or 1
+        i = min(range(len(SCALES)), key=lambda k: abs(SCALES[k] - cur))
+        self.gmax = SCALES[max(0, min(len(SCALES) - 1, i + d))]
+        self.cfg["graph_max"] = self.gmax
+        err = save_config(self.cfg_path, self.cfg_owner, self.cfg) if self.cfg_path else None
+        self.flash = (time.monotonic(), "Échelle du graphe : 0 – %s req/s%s" % (
+            fmt_rate(self.gmax), (" (non enregistrée : %s)" % err) if err else " (enregistrée)"), not err)
+
+    # -- flux : colonnes configurables -------------------------------------------
+    def ip_width(self, ips):
+        cur, ts = self._ipw
+        new = max([len(i) for i in ips] + [7])
+        now = time.monotonic()
+        if new >= cur or now - ts > 30:               # s'elargit tout de suite, retrecit lentement
+            self._ipw = (new, now)
+            return new
+        return cur
+
+    def feed_layout(self, iw, evs):
+        cols = [c for c in self.cfg["columns"] if c["on"]]
+        if not self.e.seen_host:
+            cols = [c for c in cols if c["id"] != "host"] or cols
+        if not cols:
+            cols = [{"id": "url", "on": True, "width": 40}]
+        widths = []
+        for c in cols[:-1]:
+            wd = c["width"]
+            if c["id"] == "ip" and wd == 0:
+                wd = min(39, self.ip_width([ev.ip for ev in evs]))
+            widths.append(wd)
+        last_min = COLDEF[cols[-1]["id"]][2]
+        rem = iw - sum(widths) - len(widths)
+        if rem < last_min:                              # on retrecit les colonnes elastiques
+            deficit = last_min - rem
+            for cid in ("ua", "reason", "url", "host"):
+                for i, c in enumerate(cols[:-1]):
+                    if c["id"] == cid and deficit > 0:
+                        cut = min(deficit, max(0, widths[i] - COLDEF[cid][2]))
+                        widths[i] -= cut
+                        deficit -= cut
+            rem = iw - sum(widths) - len(widths)
+        widths.append(max(1, rem))
+        return list(zip([c["id"] for c in cols], widths))
+
+    def cell(self, cid, ev):
+        """(texte, attribut, coupe_au_milieu, aligne_a_droite)"""
+        if cid == "time":
+            return datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S"), curses.A_DIM, False, False
+        if cid == "ip":
+            a = self.attr[C_BAD] | curses.A_BOLD if self.banned(ev.ip) else 0
+            return ev.ip, a, True, False
+        if cid == "code":
+            col = C_OK if ev.status < 300 else C_INFO if ev.status < 400 else C_WARN if ev.status < 500 else C_BAD
+            if ev.blocked:
+                col = C_BAD
+            return str(ev.status), self.attr[col] | curses.A_BOLD, False, False
+        if cid == "reason":
+            rc = REASON_COLOR.get(ev.reason, C_WARN) if ev.blocked else 0
+            return self.e.reason_of(ev), (self.attr[rc] if rc else 0), False, False
+        if cid == "host":
+            return ev.host, self.attr[C_TITLE], False, False
+        if cid == "method":
+            return ev.method, curses.A_DIM, False, False
+        if cid == "size":
+            return fmt_b(ev.size), curses.A_DIM, False, True
+        if cid == "ua":
+            return ev.ua, curses.A_DIM, False, False
+        return ev.path, 0, False, False
+
+    def draw_feed(self, y, fh, w):
+        e = self.e
+        title = "Requêtes en direct" + (" — bloquées seulement" if self.blocked_only else "")
+        self.box(y, 0, fh, w, title, ("↑↓ défiler" if self.scroll else "live") + " · c colonnes")
+        iw, rows = w - 4, fh - 3
+        src = e.blocked_events if self.blocked_only else e.events
+        off = self.scroll + ((e.seq - self.anchor) if self.scroll > 0 else 0)
+        n = len(src)
+        off = max(0, min(off, max(0, n - rows)))
+        evs = []
+        for i in range(rows):
+            idx = n - 1 - off - i
+            if idx < 0:
+                break
+            evs.append(src[idx])
+        layout = self.feed_layout(iw, evs)
+        x = 2
+        for cid, wd in layout:
+            self.put(y + 1, x, COLDEF[cid][0].ljust(wd), curses.A_BOLD | curses.A_UNDERLINE, wd)
+            x += wd + 1
+        for i, ev in enumerate(evs):
+            yy = y + 2 + i
+            x = 2
+            for cid, wd in layout:
+                txt, a, mid, right = self.cell(cid, ev)
+                txt = elide(txt, wd, mid)
+                self.put(yy, x, txt.rjust(wd) if right else txt.ljust(wd), a, wd)
+                x += wd + 1
+
+    # -- vue Bans -------------------------------------------------------------------
+    def compute_ban_rows(self):
+        if self.bm is None:
+            return []
+        rows = list(self.bm.bans)
+        f = self.ban_filter.lower()
+        if f:
+            rows = [b for b in rows if f in b["ip"].lower() or f in b["service"].lower()
+                    or f in b["reason"].lower() or f in b["country"].lower()]
+        now = time.monotonic()
+        for b in rows:
+            b["hits"] = self.e.c_bip.get(b["ip"], 0)
+            b["left"] = None if b["permanent"] else max(0.0, b["exp"] - (now - b["at"]))
+        key = self.BAN_SORTS[self.ban_sort][0]
+        if key == "date":
+            rows.sort(key=lambda b: -b["date"])
+        elif key == "hits":
+            rows.sort(key=lambda b: (-b["hits"], -b["date"]))
+        elif key == "remaining":
+            rows.sort(key=lambda b: float("inf") if b["left"] is None else b["left"])
+        else:
+            rows.sort(key=lambda b: (b["ip"], b["scope"], b["service"]))
+        return rows
+
+    # -- vue ModSec (tuning des faux positifs) --------------------------------------
+    MS_SORTS = [("count", "nb déclenchements"), ("recent", "plus récents"),
+                ("host", "host"), ("rule", "règle")]
+
+    def compute_ms_rows(self):
+        rows = []
+        f = self.ms_filter.lower()
+        now = time.monotonic()
+        for (host, rid), hdef in self.e.modsec.items():
+            if f and not (f in host.lower() or f in rid or f in hdef["msg"].lower()
+                          or f in hdef["uri"].lower()):
+                continue
+            excl = self.cm is not None and self.cm.excluded(host, rid)
+            rows.append({"host": host, "rid": rid, "msg": hdef["msg"], "count": hdef["count"],
+                         "ips": len(hdef["ips"]), "uri": hdef["uri"], "last": hdef["last"], "excl": excl})
+        key = self.MS_SORTS[self.ms_sort][0]
+        if key == "count":
+            rows.sort(key=lambda r: (-r["count"], -r["last"]))
+        elif key == "recent":
+            rows.sort(key=lambda r: -r["last"])
+        elif key == "host":
+            rows.sort(key=lambda r: (r["host"], r["rid"]))
+        else:
+            rows.sort(key=lambda r: (r["rid"], r["host"]))
+        return rows
+
+    def draw_modsec(self, y, h, w):
+        rows = self.ms_rows = self.compute_ms_rows()
+        nexcl = len(self.cm.exclusions) if (self.cm and not self.cm.err) else None
+        right = "tri : %s" % self.MS_SORTS[self.ms_sort][1]
+        if self.ms_filter:
+            right = "filtre « %s » · " % self.ms_filter + right
+        self.box(y, 0, h, w, "ModSecurity — déclenchements & faux positifs", right)
+        iw = w - 4
+        if self.cm is not None:
+            info = "Exclusions : %s" % self.cm.backend.label()
+            if nexcl is not None:
+                info += "   ·   %d règle(s) whitelistée(s)" % nexcl
+        else:
+            info = "Whitelist désactivée (--no-exclusions) : affichage seul"
+        self.put(y + 1, 2, info, curses.A_DIM, iw)
+        top_y = y + 2
+        if self.cm is not None and self.cm.err:
+            self.put(top_y, 2, "⚠ liste : " + self.cm.err, self.attr[C_BAD] | curses.A_BOLD, iw)
+            top_y += 1
+        if self.cm is not None and self.cm.last is not None:
+            _, ltxt, lok = self.cm.last
+            self.put(top_y, 2, ("dernière action : " + ltxt)[:iw],
+                     (self.attr[C_OK] if lok else self.attr[C_BAD]) | curses.A_BOLD, iw)
+            top_y += 1
+        hostw = min(26, max(8, max([len(r["host"]) for r in rows] + [8]))) if rows else 12
+        cols = [("", 1), ("HOST", hostw), ("RÈGLE", 7), ("REQ", 6), ("IPs", 5), ("DERNIER", 9)]
+        rest = iw - sum(wd for _, wd in cols) - len(cols)
+        cols.append(("MESSAGE / URI", max(12, rest)))
+        x = 2
+        for name, wd in cols:
+            self.put(top_y, x, name.ljust(wd), curses.A_BOLD | curses.A_UNDERLINE, wd)
+            x += wd + 1
+        list_y = top_y + 1
+        nrows = y + h - 1 - list_y
+        if not rows:
+            msg = ("Aucun déclenchement ModSecurity capté pour l'instant." if not self.ms_filter
+                   else "Aucun déclenchement ne correspond au filtre.")
+            self.put(list_y + 1, 3, msg, curses.A_DIM)
+            self.put(list_y + 3, 3, "Les règles CRS qui bloquent apparaîtront ici dès qu'elles se déclenchent.",
+                     curses.A_DIM)
+            return
+        self.ms_cur = max(0, min(self.ms_cur, len(rows) - 1))
+        if self.ms_cur < self.ms_top:
+            self.ms_top = self.ms_cur
+        if self.ms_cur >= self.ms_top + nrows:
+            self.ms_top = self.ms_cur - nrows + 1
+        self.ms_top = max(0, min(self.ms_top, max(0, len(rows) - nrows)))
+        now = time.monotonic()
+        for i in range(nrows):
+            idx = self.ms_top + i
+            if idx >= len(rows):
+                break
+            r = rows[idx]
+            sel = idx == self.ms_cur
+            base = curses.A_REVERSE if sel else 0
+            yy = list_y + i
+            if sel:
+                self.put(yy, 1, " " * (w - 2), base)
+            ago = fmt_dur(max(0, now - r["last"])) if r["last"] else "-"
+            msg = r["msg"] or "-"
+            if r["uri"]:
+                msg += "  —  " + r["uri"]
+            host = r["host"] or "(global)"
+            vals = {"": ("✔" if r["excl"] else "", self.attr[C_OK] | curses.A_BOLD),
+                    "HOST": (host, self.attr[C_TITLE]),
+                    "RÈGLE": (r["rid"], curses.A_BOLD),
+                    "REQ": (fmt_n(r["count"]), curses.A_BOLD),
+                    "IPs": (fmt_n(r["ips"]), curses.A_DIM),
+                    "DERNIER": (ago, curses.A_DIM),
+                    "MESSAGE / URI": (msg, self.attr[C_MAG] if not r["excl"] else curses.A_DIM)}
+            x = 2
+            for name, wd in cols:
+                txt, a = vals[name]
+                txt = elide(txt, wd, middle=(name == "HOST"))
+                txt = txt.rjust(wd) if name in ("REQ", "IPs", "DERNIER") else txt.ljust(wd)
+                self.put(yy, x, txt, (base | curses.A_BOLD) if sel else (a | base), wd)
+                x += wd + 1
+        if len(rows) > nrows:
+            self.put(y + h - 1, w - 22, " %d-%d / %d " % (self.ms_top + 1, min(len(rows), self.ms_top + nrows),
+                                                          len(rows)), curses.A_DIM)
+
+    def draw_msdetail(self, h, w):
+        _, host, rid = self.modal
+        hdef = self.e.modsec.get((host, rid))
+        bw = min(w - 4, 94)
+        bh = min(h - 2, 24)
+        y0, x0 = max(1, (h - bh) // 2), max(0, (w - bw) // 2)
+        self.clear_rect(y0, x0, bh, bw)
+        self.box(y0, x0, bh, bw, "ModSec %s — %s" % (rid, host or "global"))
+        iw = bw - 4
+        if not hdef:
+            self.put(y0 + 2, x0 + 2, "Plus de données pour cette règle (expirée).", curses.A_DIM)
+            return
+        self.put(y0 + 1, x0 + 2, elide(hdef["msg"] or "-", iw), self.attr[C_MAG], iw)
+        ips = sorted(hdef["ips"].items(), key=lambda kv: -kv[1][2])   # par dernier vu décroissant
+        self.put(y0 + 2, x0 + 2, "%d requête(s), %d IP distincte(s)%s" % (
+            hdef["count"], len(hdef["ips"]), "  (max 256 mémorisées)" if len(hdef["ips"]) >= 256 else ""),
+            curses.A_DIM, iw)
+        ipw = min(39, max(15, max([len(ip) for ip, _ in ips] + [15])))
+        cols = [("IP", ipw), ("HITS", 6), ("PREMIER", 15), ("DERNIER", 15)]
+        urlw = iw - sum(c[1] for c in cols) - len(cols)
+        cols.append(("DERNIÈRE URL", max(10, urlw)))
+        x = x0 + 2
+        for name, cw in cols:
+            self.put(y0 + 3, x, name.ljust(cw), curses.A_BOLD | curses.A_UNDERLINE, cw)
+            x += cw + 1
+        rows_y = y0 + 4
+        nrows = y0 + bh - 1 - rows_y
+        total = len(ips)
+        self.msd_top = max(0, min(self.msd_top, max(0, total - nrows)))
+        for i in range(nrows):
+            idx = self.msd_top + i
+            if idx >= total:
+                break
+            ip, (cnt, first, last, uri) = ips[idx]
+            vals = [(ip, 0), (fmt_n(cnt), curses.A_BOLD),
+                    (datetime.fromtimestamp(first).strftime("%d/%m %H:%M:%S"), curses.A_DIM),
+                    (datetime.fromtimestamp(last).strftime("%d/%m %H:%M:%S"), 0),
+                    (uri or "-", curses.A_DIM)]
+            x = x0 + 2
+            for (txt, a), (_, cw) in zip(vals, cols):
+                al = txt.rjust(cw) if cw == 6 else elide(txt, cw, middle=(cw == ipw))
+                self.put(rows_y + i, x, al if cw != 6 else al, a, cw)
+                x += cw + 1
+        foot = "↑↓ défiler · Échap/Entrée fermer"
+        if total > nrows:
+            foot = "%d-%d / %d · %s" % (self.msd_top + 1, min(total, self.msd_top + nrows), total, foot)
+        self.put(y0 + bh - 1, x0 + bw - len(foot) - 3, " " + foot + " ", curses.A_DIM)
+
+    def ask_whitelist(self, scope_global=False):
+        if self.cm is None:
+            self.flash = (time.monotonic(), "Whitelist désactivée (--no-exclusions)", False)
+            return
+        if not self.ms_rows:
+            return
+        r = self.ms_rows[min(self.ms_cur, len(self.ms_rows) - 1)]
+        host = "" if (scope_global or not r["host"]) else r["host"]
+        already = self.cm.excluded(host, r["rid"]) if host else (("", r["rid"]) in self.cm.keys)
+        svc, status = (host, "ok")
+        if host and not already:
+            svc, status = self.cm.backend.resolve_service(host)
+        scope_txt = "globalement (tous les services)" if not host else "pour le service %s" % svc
+        if already:
+            lines = [("Réactiver la règle ModSecurity %s %s ?" % (r["rid"], scope_txt), curses.A_BOLD),
+                     ("", 0),
+                     ("La règle n'était plus appliquée. Elle le sera de nouveau.", 0),
+                     ("Le blocage légitime qu'elle assure revient.", curses.A_DIM)]
+        else:
+            lines = [("Désactiver la règle ModSecurity %s %s ?" % (r["rid"], scope_txt), curses.A_BOLD),
+                     ("", 0),
+                     ("Message : " + (r["msg"] or "(inconnu)"), curses.A_DIM),
+                     ("Exemple d'URL : " + (r["uri"] or "-"), curses.A_DIM),
+                     ("", 0),
+                     ("Directive écrite (type modsec, après le CRS) :", self.attr[C_TITLE]),
+                     ("    SecRuleRemoveById %s;" % r["rid"], self.attr[C_MAG] | curses.A_BOLD),
+                     ("Application : " + self.cm.backend.live_note, curses.A_DIM)]
+            if status == "unmatched":
+                lines.append(("⚠ « %s » ne correspond à aucun service connu (alias ?). Vérifie, ou utilise g (global)."
+                              % host, self.attr[C_WARN]))
+            lines.append(("⚠ désactiver une règle réduit la protection : ne vise qu'un vrai faux positif.",
+                          self.attr[C_WARN]))
+        self.modal = ("fpconfirm", r, host, bool(already), lines)
+
+    def draw_bans(self, y, h, w):
+        bm = self.bm
+        if bm is None:
+            self.box(y, 0, h, w, "Bans BunkerWeb")
+            self.put(y + 2, 3, "Gestion des bans désactivée (--no-bans).", curses.A_DIM)
+            return
+        rows = self.ban_rows = self.compute_ban_rows()
+        age = time.monotonic() - bm.ok_at if bm.ok_at else None
+        right = "tri : %s · CrowdSec %s (C)" % (self.BAN_SORTS[self.ban_sort][1],
+                                                 "ON" if self.cs_on else "off")
+        if self.ban_filter:
+            right = "filtre « %s » · " % self.ban_filter + right
+        self.box(y, 0, h, w, "Bans BunkerWeb", right)
+        iw = w - 4
+        info = "Source : %s" % bm.client.label()
+        if self.cs_on:
+            info += "   ·   unban CrowdSec actif : %s" % bm.cs.label()
+        if age is not None:
+            info += "   ·   %d bans, mis à jour il y a %ds" % (len(bm.bans), age)
+        self.put(y + 1, 2, info, curses.A_DIM, iw)
+        top_y = y + 2
+        if bm.err:
+            self.put(top_y, 2, "⚠ " + bm.err, self.attr[C_BAD] | curses.A_BOLD, iw)
+            top_y += 1
+        if bm.loading:
+            self.put(top_y + 1, 3, "Chargement…", curses.A_DIM)
+            return
+        ipw = min(39, max([len(b["ip"]) for b in rows] + [7]))
+        fixed = [("", 1), ("IP", ipw), ("PORTÉE / SITE", 22), ("BANNI LE", 14), ("RESTANT", 9),
+                 ("PAYS", 4), ("TYPE", 8), ("REQ BLOQ.", 9)]
+        rest = iw - sum(wd for _, wd in fixed) - len(fixed)
+        if rest < 12:                                 # terminal etroit : on retire des colonnes
+            fixed = [c for c in fixed if c[0] not in ("PAYS", "TYPE")]
+            rest = iw - sum(wd for _, wd in fixed) - len(fixed)
+        cols = fixed[:3] + [("RAISON", max(8, rest))] + fixed[3:]
+        x = 2
+        for name, wd in cols:
+            self.put(top_y, x, name.ljust(wd), curses.A_BOLD | curses.A_UNDERLINE, wd)
+            x += wd + 1
+        list_y = top_y + 1
+        nrows = y + h - 1 - list_y
+        if not rows:
+            msg = "Aucun ban actif." if not self.ban_filter else "Aucun ban ne correspond au filtre."
+            self.put(list_y + 1, 3, msg, curses.A_DIM)
+            return
+        self.ban_cur = max(0, min(self.ban_cur, len(rows) - 1))
+        if self.ban_cur < self.ban_top:
+            self.ban_top = self.ban_cur
+        if self.ban_cur >= self.ban_top + nrows:
+            self.ban_top = self.ban_cur - nrows + 1
+        self.ban_top = max(0, min(self.ban_top, max(0, len(rows) - nrows)))
+        for i in range(nrows):
+            idx = self.ban_top + i
+            if idx >= len(rows):
+                break
+            b = rows[idx]
+            sel = idx == self.ban_cur
+            base = curses.A_REVERSE if sel else 0
+            yy = list_y + i
+            if sel:
+                self.put(yy, 1, " " * (w - 2), base)
+            scope = "global" if b["scope"] == "global" else ("default server" if b["service"] == "_" else b["service"])
+            when = datetime.fromtimestamp(b["date"]).strftime("%d/%m %H:%M:%S") if b["date"] >= 1 else "-"
+            left = "permanent" if b["left"] is None else fmt_dur(b["left"])
+            kind = "crowdsec" if b["kind"] == "crowdsec_lease" else b["kind"]
+            vals = {"": (BAN_MARK, self.attr[C_BAD] | curses.A_BOLD), "IP": (b["ip"], curses.A_BOLD),
+                    "PORTÉE / SITE": (scope, self.attr[C_WARN] if b["scope"] == "global" else self.attr[C_TITLE]),
+                    "RAISON": (b["reason"], 0), "BANNI LE": (when, curses.A_DIM),
+                    "RESTANT": (left, self.attr[C_BAD] if b["left"] is None else 0),
+                    "PAYS": (b["country"], curses.A_DIM),
+                    "TYPE": (kind, self.attr[C_MAG] if kind == "crowdsec" else curses.A_DIM),
+                    "REQ BLOQ.": (fmt_n(b["hits"]) if b["hits"] else "-", curses.A_BOLD if b["hits"] else curses.A_DIM)}
+            x = 2
+            for name, wd in cols:
+                txt, a = vals[name]
+                txt = elide(txt, wd, middle=(name == "IP"))
+                txt = txt.rjust(wd) if name in ("RESTANT", "REQ BLOQ.") else txt.ljust(wd)
+                self.put(yy, x, txt, (a | base) if not sel else (base | curses.A_BOLD), wd)
+                x += wd + 1
+        if len(rows) > nrows:
+            self.put(y + h - 1, w - 22, " %d-%d / %d " % (self.ban_top + 1, min(len(rows), self.ban_top + nrows),
+                                                          len(rows)), curses.A_DIM)
+
+    # -- fenetres modales ------------------------------------------------------------
+    def popup(self, h, w, title, lines, width=None):
+        bw = min(w - 4, width or (max(len(l[0]) for l in lines) + 6))
+        bh = min(h - 2, len(lines) + 2)
+        y0, x0 = max(1, (h - bh) // 2), max(0, (w - bw) // 2)
+        self.clear_rect(y0, x0, bh, bw)
+        self.box(y0, x0, bh, bw, title)
+        for i, (txt, a) in enumerate(lines[:bh - 2]):
+            self.put(y0 + 1 + i, x0 + 2, txt, a, bw - 4)
+        return y0, x0, bw
+
+    def draw_dialog(self, h, w):
+        m = self.modal
+        if m[0] == "confirm":
+            bans, cs_ips = m[1], m[3]
+            lines = [("", 0)]
+            for txt in m[2]:
+                lines.append((txt, curses.A_BOLD))
+            for ip in cs_ips:
+                st, val = self.cs_prev.get(ip, ("loading", None))
+                lines.append(("", 0))
+                if st == "loading":
+                    lines.append(("CrowdSec : recherche des décisions pour %s…" % ip, curses.A_DIM))
+                elif st == "err":
+                    lines.append(("CrowdSec : %s" % val, self.attr[C_BAD] | curses.A_BOLD))
+                    lines.append(("(seul le ban BunkerWeb « classique » sera levé)", curses.A_DIM))
+                elif not val:
+                    lines.append(("CrowdSec : aucune décision pour %s" % ip, curses.A_DIM))
+                else:
+                    lines.append(("CrowdSec : %d décision(s) seront supprimée(s) pour %s (cscli decisions delete) :" % (
+                        len(val), ip), self.attr[C_MAG] | curses.A_BOLD))
+                    for d in val[:4]:
+                        lines.append(("  • %s  %s  %s  %s" % (d["type"], d["origin"], d["scenario"] or "-",
+                                                              d["duration"]), self.attr[C_MAG]))
+                    if len(val) > 4:
+                        lines.append(("  … et %d autre(s)" % (len(val) - 4), self.attr[C_MAG]))
+                    if any(d["origin"] in ("CAPI", "lists") for d in val):
+                        lines.append(("  ⚠ origine CAPI/lists : peut revenir à la prochaine synchro des listes",
+                                      self.attr[C_WARN]))
+            lines += [("", 0), ("[o] confirmer      [n / Échap] annuler", self.attr[C_TITLE] | curses.A_BOLD)]
+            self.popup(h, w, "Débannir" + (" (%d bans)" % len(bans) if len(bans) > 1 else ""), lines, width=84)
+        elif m[0] == "fpconfirm":
+            title = "Réactiver une règle" if m[3] else "Whitelister un faux positif"
+            lines = [("", 0)] + list(m[4]) + [("", 0),
+                     ("[o] confirmer      [n / Échap] annuler", self.attr[C_TITLE] | curses.A_BOLD)]
+            self.popup(h, w, title, lines, width=86)
+        else:
+            lines = [("", 0)] + [(t, 0) for t in m[1]] + [("", 0), ("Appuie sur une touche.", curses.A_DIM)]
+            self.popup(h, w, "Information", lines)
+
+    def draw_cols(self, h, w):
+        cols = self.cfg["columns"]
+        lines = [("Colonnes du flux « Requêtes en direct » (la dernière prend la place restante)", curses.A_DIM),
+                 ("", 0)]
+        for i, c in enumerate(cols):
+            d = COLDEF[c["id"]]
+            wd = "auto" if (c["id"] == "ip" and c["width"] == 0) else str(c["width"])
+            txt = " [%s] %-12s largeur %-5s" % ("x" if c["on"] else " ", d[0], wd)
+            a = curses.A_REVERSE | curses.A_BOLD if i == self.col_cur else (0 if c["on"] else curses.A_DIM)
+            lines.append((txt.ljust(44), a))
+        lines += [("", 0),
+                  ("↑↓ choisir   Espace activer   ←→ largeur   a largeur auto (IP)", curses.A_DIM),
+                  ("< > déplacer   d valeurs par défaut   Entrée/Échap fermer et enregistrer", curses.A_DIM)]
+        self.popup(h, w, "Configuration des colonnes", lines, width=82)
+
+    def draw_help(self, h, w):
+        lines = [
+            ("bwtop %s — aide" % VERSION, curses.A_BOLD), ("", 0),
+            ("Tab / 1 2 3  basculer Dashboard · Bans · ModSec", 0),
+            ("q / Ctrl-C   quitter", 0),
+            ("", 0), ("Dashboard", self.attr[C_TITLE] | curses.A_BOLD),
+            ("p            geler / reprendre l'affichage", 0),
+            ("w            fenêtre de stats : 1m → 5m → 15m → 1h", 0),
+            ("b            flux : toutes les requêtes / bloquées seulement", 0),
+            ("c / F2       colonnes du flux (activer, ordre, largeur)", 0),
+            ("+ / -        échelle fixe du graphe (1, 2, 5, 10, 20, 50… req/s)", 0),
+            ("i / v        changer les panneaux du milieu / de droite", 0),
+            ("r            remettre les compteurs à zéro", 0),
+            ("↑ ↓ PgUp PgDn Home/End   défiler le flux", 0),
+            ("", 0), ("Bans", self.attr[C_TITLE] | curses.A_BOLD),
+            ("u / Suppr    débannir le ban sélectionné (confirmation)", 0),
+            ("U            débannir cette IP partout (global + tous les sites)", 0),
+            ("C            unban CrowdSec on/off : supprime aussi les décisions (cscli)", 0),
+            ("/            filtrer (IP, site, raison, pays) — Échap efface", 0),
+            ("s            changer le tri          r  rafraîchir", 0),
+            ("", 0), ("ModSec (faux positifs)", self.attr[C_TITLE] | curses.A_BOLD),
+            ("Entrée       détail : IP concernées, nb de hits, premier et dernier horodatage", 0),
+            ("w            whitelister / réactiver la règle pour le host (confirmation)", 0),
+            ("g            même chose mais en portée globale (tous les services)", 0),
+            ("/            filtrer (host, règle, message)    s  tri    r  rafraîchir", 0),
+            ("             écrit SecRuleRemoveById via bunkerweb-api ou un fichier .conf", curses.A_DIM),
+            ("", 0),
+            ("%s = IP actuellement bannie. « Bloquée » = code HTTP %s." % (
+                BAN_MARK, ",".join(str(c) for c in sorted(self.e.block_status))), curses.A_DIM),
+            ("Raison déduite de l'error.log (IP + horodatage ±%ds)." % int(CORR_WINDOW), curses.A_DIM),
+        ]
+        self.popup(h, w, "Aide", lines, width=78)
+
+    # -- actions -------------------------------------------------------------------
+    def ask_unban(self, all_scopes=False):
+        if self.bm is None or not self.ban_rows:
+            return
+        cur = self.ban_rows[min(self.ban_cur, len(self.ban_rows) - 1)]
+        if all_scopes:
+            targets = [b for b in self.bm.bans if b["ip"] == cur["ip"]]
+        else:
+            targets = [cur]
+        cs = [b for b in targets if b["kind"] == "crowdsec_lease"]
+        if not self.cs_on:
+            targets = [b for b in targets if b["kind"] != "crowdsec_lease"]
+        if not targets:
+            hint = ("active la suppression CrowdSec avec la touche C, ou sur le serveur :"
+                    if self.bm.cs is not None else "sur le serveur :")
+            self.modal = ("info", ["%s est bloquée par une décision CrowdSec." % cur["ip"],
+                                   "Pour la lever, " + hint,
+                                   "    bwcli unban %s%s -confirm" % (cur["ip"], (" -service " + cur["service"])
+                                                                      if cur["scope"] == "service" else "")])
+            return
+        lines = []
+        for b in targets:
+            where = "globalement" if b["scope"] == "global" else "du site %s" % b["service"]
+            what = "Retirer le ban CrowdSec de" if b["kind"] == "crowdsec_lease" else "Débannir"
+            lines.append("%s %s %s ?" % (what, b["ip"], where))
+        if cs and not self.cs_on:
+            lines.append("(%d ban(s) CrowdSec ignoré(s) : touche C pour les inclure)" % len(cs))
+        cs_ips = sorted({b["ip"] for b in targets}) if self.cs_on else []
+        for ip in cs_ips:
+            self.cs_prev[ip] = ("loading", None)
+            threading.Thread(target=self._cs_preview, args=(ip,), daemon=True).start()
+        self.modal = ("confirm", targets, lines, cs_ips)
+
+    def _cs_preview(self, ip):
+        try:
+            self.cs_prev[ip] = ("ok", self.bm.cs.decisions(ip))
+        except BanError as e:
+            self.cs_prev[ip] = ("err", str(e))
+        except Exception as e:
+            self.cs_prev[ip] = ("err", "%s: %s" % (type(e).__name__, e))
+
+    def key_modal(self, k):
+        m = self.modal
+        if m == "help" or (isinstance(m, tuple) and m[0] == "info"):
+            self.modal = None
+            return
+        if isinstance(m, tuple) and m[0] == "confirm":
+            if k in (ord("o"), ord("O"), ord("y"), ord("Y")):
+                cs_ips = [ip for ip in m[3] if self.cs_prev.get(ip, ("",))[0] != "err"]
+                bans = [b for b in m[1] if b["kind"] != "crowdsec_lease" or b["ip"] in cs_ips]
+                self.bm.unban(bans, cs_ips)
+                self.flash = (time.monotonic(), "Unban de %s en cours…" % ", ".join(sorted({b["ip"] for b in m[1]})), True)
+            self.modal = None
+            return
+        if isinstance(m, tuple) and m[0] == "msdetail":
+            page = max(1, self.s.getmaxyx()[0] - 10)
+            if k in (curses.KEY_UP, ord("k")):
+                self.msd_top = max(0, self.msd_top - 1)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.msd_top += 1
+            elif k == curses.KEY_PPAGE:
+                self.msd_top = max(0, self.msd_top - page)
+            elif k == curses.KEY_NPAGE:
+                self.msd_top += page
+            elif k in (curses.KEY_HOME,):
+                self.msd_top = 0
+            elif k in (ESC, 10, 13, curses.KEY_ENTER, ord("q")):
+                self.modal = None
+            return
+        if isinstance(m, tuple) and m[0] == "fpconfirm":
+            if k in (ord("o"), ord("O"), ord("y"), ord("Y")) and self.cm is not None:
+                r = m[1]
+                self.cm.toggle(r["host"], r["rid"], r["msg"], scope_global=(m[2] == ""))
+                self.flash = (time.monotonic(), "Règle %s : demande envoyée…" % r["rid"], True)
+            self.modal = None
+            return
+        if isinstance(m, tuple) and m[0] == "filter":
+            buf = m[1]
+            if k in (10, 13, curses.KEY_ENTER):
+                if self.view == "modsec":
+                    self.ms_filter = buf.strip()
+                    self.ms_cur = self.ms_top = 0
+                else:
+                    self.ban_filter = buf.strip()
+                    self.ban_cur = self.ban_top = 0
+                self.modal = None
+            elif k == ESC:
+                self.modal = None
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                self.modal = ("filter", buf[:-1])
+            elif 32 <= k < 127:
+                self.modal = ("filter", buf + chr(k))
+            return
+        if m == "cols":
+            cols = self.cfg["columns"]
+            c = cols[self.col_cur]
+            d = COLDEF[c["id"]]
+            if k in (curses.KEY_UP, ord("k")):
+                self.col_cur = (self.col_cur - 1) % len(cols)
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.col_cur = (self.col_cur + 1) % len(cols)
+            elif k in (ord(" "), ord("x")):
+                c["on"] = not c["on"]
+                if not any(cc["on"] for cc in cols):
+                    c["on"] = True
+            elif k in (curses.KEY_RIGHT, ord("l"), ord("+")):
+                c["width"] = d[2] if c["width"] == 0 else min(d[3], c["width"] + 1)
+            elif k in (curses.KEY_LEFT, ord("h"), ord("-")):
+                if c["id"] == "ip" and c["width"] <= d[2]:
+                    c["width"] = 0
+                elif c["width"]:
+                    c["width"] = max(d[2], c["width"] - 1)
+            elif k == ord("a") and c["id"] == "ip":
+                c["width"] = 0
+            elif k == ord("<") and self.col_cur > 0:
+                i = self.col_cur
+                cols[i - 1], cols[i] = cols[i], cols[i - 1]
+                self.col_cur -= 1
+            elif k == ord(">") and self.col_cur < len(cols) - 1:
+                i = self.col_cur
+                cols[i + 1], cols[i] = cols[i], cols[i + 1]
+                self.col_cur += 1
+            elif k == ord("d"):
+                self.cfg["columns"] = default_columns()
+            elif k in (10, 13, curses.KEY_ENTER, ESC, ord("q"), ord("c"), curses.KEY_F2):
+                self.modal = None
+                if self.cfg_path:
+                    err = save_config(self.cfg_path, self.cfg_owner, self.cfg)
+                    self.flash = (time.monotonic(), ("Colonnes enregistrées dans " + self.cfg_path) if not err
+                                  else "Colonnes appliquées, mais non enregistrées : " + err, not err)
+
+    def key(self, k):
+        e = self.e
+        if self.modal is not None:
+            self.key_modal(k)
+            return True
+        if k in (ord("q"), ord("Q"), 3):
+            return False
+        order = ["dash", "bans", "modsec"]
+        if k == 9:
+            self.view = order[(order.index(self.view) + 1) % 3]
+            return True
+        if k == curses.KEY_BTAB:
+            self.view = order[(order.index(self.view) - 1) % 3]
+            return True
+        if k == ord("1"):
+            self.view = "dash"
+            return True
+        if k == ord("2"):
+            self.view = "bans"
+            return True
+        if k == ord("3"):
+            self.view = "modsec"
+            return True
+        if k in (ord("h"), ord("?")):
+            self.modal = "help"
+            return True
+        if self.view == "bans":
+            return self.key_bans(k)
+        if self.view == "modsec":
+            return self.key_modsec(k)
+        if k in (ord("p"), ord(" ")):
+            self.paused = not self.paused
+        elif k in (ord("w"), ord("W")):
+            self.win_idx = (self.win_idx + 1) % len(WINDOWS)
+            e.set_window(WINDOWS[self.win_idx][1])
+        elif k in (ord("b"), ord("B")):
+            self.blocked_only = not self.blocked_only
+            self.scroll = 0
+        elif k in (ord("+"), ord("=")):
+            self.set_scale(+1)
+        elif k in (ord("-"), ord("_")):
+            self.set_scale(-1)
+        elif k in (ord("c"), ord("C"), curses.KEY_F2):
+            self.modal = "cols"
+            self.col_cur = 0
+        elif k == ord("u"):
+            self.view = "bans"
+        elif k == ord("i"):
+            self.mid_view = (self.mid_view + 1) % len(self.MID_VIEWS)
+        elif k == ord("v"):
+            self.right_view = (self.right_view + 1) % len(self.RIGHT_VIEWS)
+        elif k in (ord("r"), ord("R")):
+            e.reset()
+            e.set_window(e.window_secs)
+            self.scroll = 0
+        elif k in (curses.KEY_UP, ord("k")):
+            self._scroll(1)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            self._scroll(-1)
+        elif k == curses.KEY_PPAGE:
+            self._scroll(10)
+        elif k == curses.KEY_NPAGE:
+            self._scroll(-10)
+        elif k in (curses.KEY_HOME, ord("g")):
+            self._scroll(10 ** 6)
+        elif k in (curses.KEY_END, ord("G")):
+            self.scroll = 0
+        return True
+
+    def key_bans(self, k):
+        n = len(self.ban_rows)
+        page = max(1, self.s.getmaxyx()[0] - 8)
+        if k in (curses.KEY_UP, ord("k")):
+            self.ban_cur = max(0, self.ban_cur - 1)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            self.ban_cur = min(max(0, n - 1), self.ban_cur + 1)
+        elif k == curses.KEY_PPAGE:
+            self.ban_cur = max(0, self.ban_cur - page)
+        elif k == curses.KEY_NPAGE:
+            self.ban_cur = min(max(0, n - 1), self.ban_cur + page)
+        elif k in (curses.KEY_HOME, ord("g")):
+            self.ban_cur = 0
+        elif k in (curses.KEY_END, ord("G")):
+            self.ban_cur = max(0, n - 1)
+        elif k in (ord("u"), curses.KEY_DC):
+            self.ask_unban(False)
+        elif k == ord("U"):
+            self.ask_unban(True)
+        elif k == ord("C"):
+            if self.bm is None or self.bm.cs is None:
+                self.flash = (time.monotonic(), "Unban CrowdSec indisponible (lancé avec --no-crowdsec)", False)
+            else:
+                self.cs_on = not self.cs_on
+                self.cfg["crowdsec_unban"] = self.cs_on
+                err = save_config(self.cfg_path, self.cfg_owner, self.cfg) if self.cfg_path else None
+                self.flash = (time.monotonic(), ("Unban CrowdSec ACTIVÉ : u/U supprimeront aussi les décisions "
+                                                 "(%s)" % self.bm.cs.label()) if self.cs_on else
+                              "Unban CrowdSec désactivé : seuls les bans BunkerWeb seront levés"
+                              + (" (non enregistré : %s)" % err if err else ""), True)
+        elif k == ord("/"):
+            self.modal = ("filter", self.ban_filter)
+        elif k == ESC:
+            self.ban_filter = ""
+        elif k in (ord("s"), ord("S")):
+            self.ban_sort = (self.ban_sort + 1) % len(self.BAN_SORTS)
+            self.ban_cur = self.ban_top = 0
+        elif k in (ord("r"), ord("R"), curses.KEY_F5):
+            if self.bm is not None:
+                self.bm.refresh()
+                self.flash = (time.monotonic(), "Rafraîchissement des bans…", True)
+        elif k in (ord("p"), ord(" ")):
+            self.paused = not self.paused
+        return True
+
+    def key_modsec(self, k):
+        n = len(self.ms_rows)
+        page = max(1, self.s.getmaxyx()[0] - 8)
+        if k in (curses.KEY_UP, ord("k")):
+            self.ms_cur = max(0, self.ms_cur - 1)
+        elif k in (curses.KEY_DOWN, ord("j")):
+            self.ms_cur = min(max(0, n - 1), self.ms_cur + 1)
+        elif k == curses.KEY_PPAGE:
+            self.ms_cur = max(0, self.ms_cur - page)
+        elif k == curses.KEY_NPAGE:
+            self.ms_cur = min(max(0, n - 1), self.ms_cur + page)
+        elif k in (curses.KEY_HOME,):
+            self.ms_cur = 0
+        elif k in (curses.KEY_END,):
+            self.ms_cur = max(0, n - 1)
+        elif k in (10, 13, curses.KEY_ENTER):
+            if self.ms_rows:
+                r = self.ms_rows[min(self.ms_cur, len(self.ms_rows) - 1)]
+                self.msd_top = 0
+                self.modal = ("msdetail", r["host"], r["rid"])
+        elif k == ord("w"):
+            self.ask_whitelist(scope_global=False)
+        elif k == ord("g"):
+            self.ask_whitelist(scope_global=True)
+        elif k == ord("/"):
+            self.modal = ("filter", self.ms_filter)
+        elif k == ESC:
+            self.ms_filter = ""
+        elif k in (ord("s"), ord("S")):
+            self.ms_sort = (self.ms_sort + 1) % len(self.MS_SORTS)
+            self.ms_cur = self.ms_top = 0
+        elif k in (ord("r"), ord("R"), curses.KEY_F5):
+            if self.cm is not None:
+                self.cm.refresh()
+                self.flash = (time.monotonic(), "Rafraîchissement des exclusions…", True)
+        elif k in (ord("p"), ord(" ")):
+            self.paused = not self.paused
+        return True
+
+    def _scroll(self, d):
+        if self.scroll == 0 and d > 0:
+            self.anchor = self.e.seq
+        cur = self.scroll + ((self.e.seq - self.anchor) if self.scroll > 0 else 0)
+        new = max(0, cur + d)
+        self.scroll = new
+        self.anchor = self.e.seq
+
+
+# Sequences que certains terminaux envoient meme quand terminfo ne les decrit pas
+# (TERM incorrect, tmux/screen, client SSH) : on les decode nous-memes.
+RAW_KEYS = {"[A": curses.KEY_UP, "[B": curses.KEY_DOWN, "[C": curses.KEY_RIGHT, "[D": curses.KEY_LEFT,
+            "OA": curses.KEY_UP, "OB": curses.KEY_DOWN, "OC": curses.KEY_RIGHT, "OD": curses.KEY_LEFT,
+            "[H": curses.KEY_HOME, "[F": curses.KEY_END, "OH": curses.KEY_HOME, "OF": curses.KEY_END,
+            "[1~": curses.KEY_HOME, "[4~": curses.KEY_END, "[7~": curses.KEY_HOME, "[8~": curses.KEY_END,
+            "[5~": curses.KEY_PPAGE, "[6~": curses.KEY_NPAGE, "[3~": curses.KEY_DC, "[Z": curses.KEY_BTAB,
+            "OQ": curses.KEY_F2, "[12~": curses.KEY_F2, "[15~": curses.KEY_F5}
+
+
+def read_key(scr):
+    k = scr.getch()
+    if k != ESC:
+        return k
+    scr.nodelay(True)
+    seq = ""
+    try:
+        while len(seq) < 5:
+            c = scr.getch()
+            if c == -1 or not 0 <= c < 256:
+                break
+            seq += chr(c)
+            if seq in RAW_KEYS:
+                return RAW_KEYS[seq]
+            if seq[0] not in "[O" or (len(seq) > 1 and (seq[-1].isalpha() or seq[-1] == "~")):
+                break
+    finally:
+        scr.nodelay(False)
+    for c in reversed(seq):                    # sequence inconnue : on rend les caracteres
+        curses.ungetch(ord(c))
+    return ESC
+
+
+def run(scr, eng, source_label, color, bans, cfg, cfg_path, cfg_owner, configmgr):
+    curses.set_escdelay(25) if hasattr(curses, "set_escdelay") else None
+    ui = UI(scr, eng, source_label, color, bans, cfg, cfg_path, cfg_owner, configmgr)
+    last = 0.0
+    dirty = True
+    while True:
+        eng.pump()
+        scr.timeout(15 if not eng.q.empty() else 120)
+        k = read_key(scr)
+        if k != -1:
+            if k == curses.KEY_RESIZE:
+                dirty = True
+            elif not ui.key(k):
+                return
+            else:
+                dirty = True
+        now = time.time()
+        if (dirty or now - last >= 0.5) and (not ui.paused or dirty):
+            ui.draw()
+            last, dirty = now, False
+
+
+# --------------------------------------------------------------------------- #
+#  main
+# --------------------------------------------------------------------------- #
+
+TERMINFO_PATHS = ("/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo", "/usr/lib/terminfo",
+                  "/usr/local/share/terminfo", "/usr/share/lib/terminfo")
+
+
+def ensure_terminfo():
+    """Rend curses robuste dans un binaire PyInstaller / sous sudo.
+
+    La libncurses embarquee garde les chemins terminfo de la machine de build ; on lui
+    indique ceux de la machine courante, et on se rabat sur xterm-256color si le TERM
+    est absent ou inconnu (ex. xterm-kitty, alacritty, TERM perdu par sudo...).
+    """
+    if not os.environ.get("TERMINFO"):
+        dirs = [d for d in TERMINFO_PATHS if os.path.isdir(d)]
+        if dirs:
+            cur = [d for d in os.environ.get("TERMINFO_DIRS", "").split(":") if d]
+            os.environ["TERMINFO_DIRS"] = ":".join(cur + [d for d in dirs if d not in cur]) + ":"
+    if not os.environ.get("TERM"):
+        os.environ["TERM"] = "xterm-256color"
+    try:
+        curses.setupterm()
+    except curses.error:
+        bad = os.environ.get("TERM")
+        os.environ["TERM"] = "xterm-256color"
+        try:
+            curses.setupterm()
+        except curses.error:
+            sys.exit("bwtop: base terminfo introuvable (TERM=%s). Installe-la : "
+                     "apt install ncurses-base ncurses-term  |  dnf install ncurses-base" % bad)
+
+
+def build_ban_client(args, eng):
+    if args.no_bans:
+        return None
+    if args.demo and not args.bans_url:
+        return DemoBans(eng)
+    env, _ = read_env_files()
+    token = args.bans_token if args.bans_token is not None else (env.get("API_TOKEN") or os.environ.get("API_TOKEN"))
+    if args.bans_api == "central":
+        url = args.bans_url or "http://127.0.0.1:8888"
+        host = args.bans_host or ""
+    else:
+        if args.bans_url:
+            url = args.bans_url
+        elif (env.get("API_LISTEN_HTTPS") or "no").lower() == "yes":
+            url = "https://127.0.0.1:%s" % (env.get("API_HTTPS_PORT") or "5443")
+        else:
+            url = "http://127.0.0.1:%s" % (env.get("API_HTTP_PORT") or "5000")
+        host = args.bans_host or env.get("API_SERVER_NAME") or "bwapi"
+    client = BanClient(url, host, token, args.bans_api, insecure=args.insecure or url.startswith("https://127."))
+    if args.unban_via == "bwcli":
+        prefix = ["docker", "exec", args.docker] if args.docker else []
+        client = BwcliUnban(client, prefix)
+    return client
+
+
+BWTOP_ENV_SYSTEM = "/etc/bwtop/bwtop.env"
+
+
+def bwtop_env_paths(override=None):
+    paths = [override] if override else [BWTOP_ENV_SYSTEM]
+    try:
+        paths.append(os.path.join(os.path.dirname(config_path()[0]), "bwtop.env"))
+    except Exception:
+        pass
+    return tuple(p for p in paths if p)
+
+
+def resolve_api(args):
+    """(url, token, source) pour le plan de contrôle, en lisant CLI puis le fichier bwtop.env."""
+    bwenv, _ = read_env_files(bwtop_env_paths(getattr(args, "fp_config", None)))
+    token = args.config_api_token or bwenv.get("CONFIG_API_TOKEN") or bwenv.get("API_TOKEN") or os.environ.get("CONFIG_API_TOKEN")
+    if args.config_api_token:
+        src = "--config-api-token"
+    elif bwenv.get("CONFIG_API_TOKEN") or bwenv.get("API_TOKEN"):
+        src = "fichier bwtop.env"
+    elif os.environ.get("CONFIG_API_TOKEN"):
+        src = "env CONFIG_API_TOKEN"
+    else:
+        src = None
+    url = (args.config_api_url or bwenv.get("CONFIG_API_URL")
+           or (args.bans_url if args.bans_api == "central" and args.bans_url else None)
+           or "http://127.0.0.1:8888")
+    return url, token, src
+
+
+def build_config_backend(args, ban_client):
+    """Backend d'exclusion ModSec. api = plan de contrôle bunkerweb-api ; file = fichiers .conf + reload."""
+    if args.no_fp_config:
+        return None
+    if args.demo:
+        return DemoConfig()
+    env, _ = read_env_files()
+    url, token, _ = resolve_api(args)
+    want = args.fp_backend
+    if want == "auto":                            # API si un token est dispo, sinon fichier + restart
+        want = "api" if token else "file"
+    if want == "api":
+        tr = BanClient(url, "", token, "central",
+                       insecure=args.insecure or url.startswith("https://127."))
+        return ApiConfigBackend(tr)
+    reload_cmd = args.reload_cmd.split() if args.reload_cmd else None   # None -> restart (défaut du backend)
+    return FileConfigBackend(base=args.modsec_dir, reload_cmd=reload_cmd, env=env)
+
+
+def _scheduler_reject_reason():
+    """Lit les logs récents du scheduler (root) pour remonter la vraie raison du rejet d'une config."""
+    import shutil
+    out = []
+    try:
+        if shutil.which("journalctl"):
+            p = subprocess.run(["journalctl", "-u", "bunkerweb-scheduler", "--since", "2 min ago",
+                                "--no-pager", "-n", "300"], capture_output=True, text=True, timeout=15)
+            text = p.stdout or ""
+        else:
+            text = ""
+            for lp in ("/var/log/bunkerweb/scheduler.log", "/var/log/bunkerweb/error.log"):
+                try:
+                    with open(lp, encoding="utf-8", errors="replace") as f:
+                        text += f.read()[-20000:]
+                except OSError:
+                    pass
+    except (OSError, subprocess.TimeoutExpired):
+        return out
+    rx = re.compile(r"(not found|refus|reject|invalid|custom config|Service .* not found|modsec|couldn't save|can't save)", re.I)
+    for ln in text.splitlines():
+        if rx.search(ln) and "selftest" not in ln and "Checking if there are any changes" not in ln:
+            out.append(ANSI_RE.sub("", ln).strip()[:160])
+    return out[-6:]
+
+
+def _probe_services_api(backend, services, line, probe_name, probe_data):
+    import time as _t
+    posted = []
+    for svc in services:
+        try:
+            backend._call("POST", "/configs", {"type": "modsec", "name": probe_name,
+                          "data": probe_data, "service": svc or "global"})
+            posted.append(svc)
+        except ConfigError as e:
+            line(False, "service %-28s : POST refusé — %s" % (svc or "(global)", e))
+    _t.sleep(2)
+    try:
+        _, js = backend._call("GET", "/configs?type=modsec&with_data=false")
+    except ConfigError as e:
+        line(False, "GET /configs a échoué : %s" % e)
+        js = []
+    items = js if isinstance(js, list) else (js.get("configs") or js.get("data") or [])
+    present = {(it.get("service") or it.get("service_id") or "global") for it in items
+               if isinstance(it, dict) and it.get("name") == probe_name}
+    okc = 0
+    for svc in posted:
+        ok = (svc or "global") in present
+        line(ok, "service %-28s : %s" % (svc or "(global)", "OK (écrit en base)" if ok else "ÉCHEC"))
+        okc += ok
+        try:
+            backend._call("DELETE", "/configs/%s/modsec/%s" % (svc or "global", probe_name))
+        except ConfigError:
+            pass
+    return okc, len(services)
+
+
+def _probe_services_file(backend, services, line, probe_name, probe_data):
+    import time as _t
+    written = []
+    for svc in services:
+        d = os.path.join(backend.base, svc) if svc else backend.base
+        path = os.path.join(d, probe_name + ".conf")
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(probe_data)
+            written.append(path)
+        except OSError as e:
+            line(False, "service %-28s : écriture impossible — %s" % (svc or "(global)", e))
+    if not written:
+        return 0, len(services)
+    print("     %s — un seul redémarrage pour tous les services, patiente ..." % " ".join(backend.reload_cmd))
+    try:
+        backend.apply()
+    except ConfigError as e:
+        line(False, "reload/restart a échoué : %s" % e)
+        for path in written:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return 0, len(services)
+    _t.sleep(8)
+    okc = 0
+    for path in written:
+        svc = os.path.basename(os.path.dirname(path)) if os.path.dirname(path) != backend.base else ""
+        present = os.path.exists(path)
+        line(present, "service %-28s : %s" % (svc or "(global)", "OK (importé en base)" if present else "ÉCHEC (effacé)"))
+        okc += present
+    for path in written:                              # nettoyage : on retire les témoins
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        backend.apply()
+    except ConfigError:
+        pass
+    if okc < len(written):
+        reason = _scheduler_reject_reason()
+        if reason:
+            print("        Raison dans les logs du scheduler :")
+            for rl in reason:
+                print("          > " + rl)
+        if "restart" not in " ".join(backend.reload_cmd):
+            print("        → « systemctl reload » ne réimporte pas les fichiers ; utilise")
+            print("          --reload-cmd \"systemctl restart bunkerweb-scheduler\"")
+    return okc, len(services)
+
+
+def save_api_token_file(path, url, token):
+    """Écrit le fichier bwtop.env (0600) avec l'URL et le token du plan de contrôle. Retourne None ou un message d'erreur."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("# bwtop : accès au plan de contrôle bunkerweb-api\n")
+            f.write("CONFIG_API_URL=%s\n" % (url or "http://127.0.0.1:8888"))
+            f.write("CONFIG_API_TOKEN=%s\n" % token)
+        os.chmod(path, 0o600)
+        return None
+    except OSError as e:
+        return str(e)
+
+
+def detect_crowdsec(args):
+    """(cscli_present, service_actif|None)."""
+    import shutil
+    cmd = (args.cscli or "cscli").split()[0]
+    have = bool(shutil.which(cmd) or os.path.exists(cmd))
+    active = None
+    if shutil.which("systemctl"):
+        try:
+            r = subprocess.run(["systemctl", "is-active", "crowdsec"], capture_output=True, text=True, timeout=5)
+            active = r.stdout.strip() == "active"
+        except (OSError, subprocess.TimeoutExpired):
+            active = None
+    return have, active
+
+
+def run_wizard(args, explicit):
+    """Assistant de configuration : détecte l'environnement, choisit le backend d'exclusion, enregistre la config."""
+    prog = os.path.basename(sys.argv[0])
+
+    def ask(q, default=""):
+        try:
+            v = input(q).strip()
+            return v if v else default
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return default
+
+    def yn(q, default=False):
+        a = ask("%s [%s] " % (q, "O/n" if default else "o/N")).lower()
+        return default if not a else a in ("o", "oui", "y", "yes")
+
+    print("bwtop %s — assistant de configuration\n" % VERSION)
+    euid = os.geteuid() if hasattr(os, "geteuid") else -1
+    if euid != 0:
+        print("  ⚠ pas lancé en root : relance avec `sudo` pour l'accès aux logs et aux configs BunkerWeb.\n")
+    env, read = read_env_files()
+    print("Environnement")
+    print("  variables.env : %s" % (", ".join(read) if read else "non trouvé"))
+    have_cli, active = detect_crowdsec(args)
+    cs_detected = have_cli
+    print("  CrowdSec      : %s" % ("détecté (cscli présent%s)" % (", service actif" if active else "")
+                                     if have_cli else "non détecté"))
+
+    cfg_path, cfg_owner = config_path(args.config)
+    cfg = load_config(cfg_path)
+
+    # --- Choix du backend d'exclusion ModSecurity ---------------------------
+    print("\nExclusions ModSecurity (correction des faux positifs) — deux modes :")
+    print("  1) API bunkerweb-api : exclusions en base, éditables dans l'UI, sans redémarrage du scheduler")
+    print("  2) Fichier           : écrit des .conf et redémarre le scheduler (marche sans bunkerweb-api)")
+    choice = ask("Ton choix [1/2] (défaut 1) : ", "1")
+    token_path = args.fp_config or BWTOP_ENV_SYSTEM
+    if choice == "1":
+        url = ask("URL du plan de contrôle [http://127.0.0.1:8888] : ", "http://127.0.0.1:8888")
+        token = ask("Jeton API (API_TOKEN de /etc/bunkerweb/api.env) : ")
+        ok = False
+        if token:
+            try:
+                tr = BanClient(url, "", token, "central", insecure=url.startswith("https://127."))
+                ids, _ = ApiConfigBackend(tr).services()
+                print("  ✔ API joignable : %d service(s) détecté(s)." % len(ids))
+                ok = True
+            except Exception as e:
+                print("  ✘ API injoignable : %s" % e)
+        else:
+            print("  (aucun jeton saisi)")
+        if ok:
+            err = save_api_token_file(token_path, url, token)
+            if err:
+                print("  ✘ impossible d'écrire %s : %s" % (token_path, err))
+                print("    → bascule sur le mode fichier.")
+                choice = "2"
+            else:
+                print("  ✔ token enregistré dans %s (0600). bwtop utilisera l'API par défaut." % token_path)
+        else:
+            if yn("Basculer sur le mode fichier (écriture .conf + restart du scheduler) ?", True):
+                choice = "2"
+            else:
+                print("  Tu pourras réessayer plus tard : %s --setup" % prog)
+    if choice == "2":
+        print("  Mode fichier retenu : bwtop écrira dans %s et lancera" % MODSEC_DIR)
+        print("  « systemctl restart bunkerweb-scheduler » après chaque lot de whitelists.")
+        if os.path.exists(token_path):
+            print("  (un fichier token existe à %s : en mode auto, l'API resterait prioritaire ;" % token_path)
+            print("   supprime-le pour forcer le mode fichier, ou lance avec --exclusions-backend file.)")
+
+    # --- CrowdSec : consentement explicite ----------------------------------
+    if cs_detected and not args.no_crowdsec:
+        on = yn("\nCrowdSec détecté. Activer la suppression des décisions CrowdSec lors d'un unban ?", False)
+        cfg["crowdsec_unban"] = bool(on)
+        print("  Unban CrowdSec : %s" % ("activé" if on else "désactivé (touche C pour basculer en direct)"))
+    elif not cs_detected:
+        cfg["crowdsec_unban"] = False
+
+    # --- Enregistrement ------------------------------------------------------
+    cfg["setup"] = 1
+    err = save_config(cfg_path, cfg_owner, cfg)
+    print("\nConfiguration enregistrée dans %s%s." % (cfg_path, "" if not err else " (erreur : %s)" % err))
+
+    if yn("Lancer une vérification complète maintenant (--selftest) ?", False):
+        print()
+        selftest(args)
+
+    print("\nC'est prêt. Lance simplement :  sudo %s" % prog)
+    print("Pour reconfigurer plus tard (ex. CrowdSec installé après coup) :  sudo %s --setup\n" % prog)
+    return 0
+
+
+def _list_services_modsec(backend, services, line):
+    if not services:
+        return
+    print("     services et état ModSecurity :")
+    on = 0
+    for svc in services:
+        try:
+            st = backend.service_modsec(svc)
+        except Exception:
+            st = None
+        tag = "ModSec ON " if st is True else ("ModSec OFF" if st is False else "ModSec ?  ")
+        on += 1 if st is True else 0
+        print("        %-36s %s" % (svc, tag))
+    line(None, "ModSec actif sur %d/%d service(s) détecté(s)" % (on, len(services)))
+
+
+def selftest(args):
+    """Diagnostic complet : vérifie tous les prérequis de bwtop et teste l'application ModSec sur tous les services."""
+    problems = [0]
+
+    def line(ok, txt):
+        if ok is False:
+            problems[0] += 1
+        mark = "  OK " if ok is True else ("  !! " if ok is False else "     ")
+        print(mark + txt)
+
+    def section(name):
+        print("\n[%s]" % name)
+
+    print("bwtop %s — diagnostic complet\n" % VERSION)
+
+    # --- Environnement -------------------------------------------------------
+    section("Environnement")
+    euid = os.geteuid() if hasattr(os, "geteuid") else -1
+    line(euid == 0 if euid >= 0 else None,
+         "utilisateur : uid=%d%s" % (euid, "  (root)" if euid == 0 else "  (PAS root — logs et configs peuvent être inaccessibles)"))
+    try:
+        import curses as _c
+        for d in TERMINFO_PATHS:
+            if os.path.isdir(d):
+                break
+        _c.setupterm(term=os.environ.get("TERM") or "xterm-256color", fd=1)
+        line(True, "terminal / terminfo : OK (TERM=%s)" % (os.environ.get("TERM") or "xterm-256color"))
+    except Exception as e:
+        line(False, "terminfo : %s — installe ncurses-base/ncurses-term" % e)
+    env, read = read_env_files()
+    line(bool(read), "variables.env : %s" % (", ".join(read) if read else "AUCUN (droits ? install non standard ?)"))
+
+    # --- Sources de logs -----------------------------------------------------
+    section("Sources de logs (dashboard)")
+    if args.demo:
+        line(None, "mode --demo : trafic synthétique, pas de logs réels.")
+    elif args.source == "-":
+        line(None, "mode stdin : les logs arrivent par un pipe.")
+    elif args.docker:
+        import shutil
+        line(bool(shutil.which("docker")), "mode docker : conteneur « %s » via `docker logs`%s"
+             % (args.docker, "" if shutil.which("docker") else " — `docker` introuvable"))
+    else:
+        for lab, path in (("access.log (trafic)", args.access), ("error.log (raisons/ModSec)", args.error)):
+            ok = os.access(path, os.R_OK)
+            line(ok, "%s : %s%s" % (lab, path, "" if ok else "  INTROUVABLE/illisible"))
+
+    # --- Bans ----------------------------------------------------------------
+    section("Bans")
+    if args.no_bans:
+        line(None, "désactivé (--no-bans).")
+    else:
+        try:
+            client = build_ban_client(args, None)
+            lbl = client.label() if client else "?"
+            bans = client.list()
+            line(True, "API bans joignable (%s) : %d ban(s) actif(s)" % (lbl, len(bans)))
+        except BanError as e:
+            line(False, "API bans injoignable : %s" % e)
+        except Exception as e:
+            line(False, "bans : %s" % e)
+        if not args.no_crowdsec and not args.demo:
+            import shutil
+            exe = (args.cscli or "cscli").split()[0]
+            ok = bool(shutil.which(exe) or os.path.exists(exe))
+            line(ok, "cscli (unban CrowdSec) : %s%s" % (args.cscli, "" if ok else "  introuvable (--cscli ? sinon ignore)"))
+
+    # --- Exclusions ModSecurity ---------------------------------------------
+    section("Exclusions ModSecurity (faux positifs)")
+    if args.no_fp_config:
+        line(None, "désactivé (--no-exclusions).")
+        print()
+        print("Résumé : %d problème(s) détecté(s)." % problems[0] if problems[0] else "Résumé : tout est OK.")
+        return 1 if problems[0] else 0
+    _, _, src = resolve_api(args)
+    backend = build_config_backend(args, None)
+    if isinstance(backend, ApiConfigBackend):
+        line(bool(src), "backend : API bunkerweb-api (%s) — token %s" % (backend.t.url, ("trouvé via %s" % src) if src else "ABSENT"))
+        try:
+            services = backend.list_services()
+            line(True, "services connus de l'API : %d" % len(services))
+            _list_services_modsec(backend, services, line)
+        except Exception as e:
+            line(False, "GET /services a échoué : %s" % e)
+            services = []
+    elif isinstance(backend, FileConfigBackend):
+        line(None, "backend : FICHIER %s + « %s » (pas de token API → repli fichier)"
+             % (backend.base, " ".join(backend.reload_cmd)))
+        probe = os.path.join(backend.base, "bwtop_selftest_w.conf")
+        try:
+            os.makedirs(backend.base, exist_ok=True)
+            with open(probe, "w", encoding="utf-8") as f:
+                f.write("# test\n")
+            os.remove(probe)
+            line(True, "écriture dans %s : OK" % backend.base)
+        except OSError as e:
+            line(False, "écriture dans %s IMPOSSIBLE : %s%s" % (backend.base, e, "" if euid == 0 else "  (lance avec sudo)"))
+        import shutil
+        exe = backend.reload_cmd[0]
+        line(bool(shutil.which(exe) or os.path.exists(exe)),
+             "commande de reload : %s" % " ".join(backend.reload_cmd))
+        services = backend.list_services()
+        line(bool(services), "services détectés : %d%s" % (len(services), "" if services else "  (aucun — config en base ? test en global)"))
+        _list_services_modsec(backend, services, line)
+    else:
+        line(None, "backend : simulation (--demo)")
+        services = backend.list_services()
+
+    # Test réel sur TOUS les services détectés (+ global)
+    if not args.no_apply_test:
+        targets = list(services)
+        if "" not in targets:
+            targets = targets + [""]                 # on teste aussi la portée globale
+        print("\n— application réelle sur %d cible(s) (témoin inoffensif, puis nettoyage) —" % len(targets))
+        probe_data = ("# bwtop selftest — témoin ; retire une règle inexistante (sans effet réel)\n"
+                      "SecRuleRemoveById 2147483646;\n")
+        try:
+            if isinstance(backend, ApiConfigBackend):
+                okc, tot = _probe_services_api(backend, targets, line, "bwtop_selftest", probe_data)
+            elif isinstance(backend, FileConfigBackend):
+                okc, tot = _probe_services_file(backend, targets, line, "bwtop_selftest", probe_data)
+            else:
+                line(None, "mode démo : application simulée, pas de test réel")
+                okc = tot = len(targets)
+            line(okc == tot, "bilan application : %d/%d cible(s) OK" % (okc, tot))
+        except Exception as e:
+            line(False, "test d'application interrompu : %s" % e)
+    else:
+        line(None, "test d'application ignoré (--no-apply-test).")
+
+    # Filtre éventuel : résolution d'un host précis
+    if args.fp_selftest:
+        svc, status = backend.resolve_service(args.fp_selftest)
+        msg = {"ok": "→ service « %s »" % svc,
+               "unmatched": "host inconnu de la config → whitelist en GLOBAL conseillée (touche g)",
+               "unknown": "liste de services indisponible → host utilisé tel quel"}[status]
+        line(status == "ok", "résolution de « %s » : %s" % (args.fp_selftest, msg))
+
+    print()
+    print("Résumé : %d problème(s) à regarder ci-dessus." % problems[0] if problems[0] else "Résumé : tout est OK, bwtop est pleinement fonctionnel.")
+    return 1 if problems[0] else 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="bwtop", description="Dashboard curses temps réel pour BunkerWeb (trafic HTTP, blocages, raisons, bans).")
+    ap.add_argument("source", nargs="?", help="'-' pour lire les logs sur stdin")
+    ap.add_argument("-a", "--access", default="/var/log/bunkerweb/access.log", help="access.log nginx/BunkerWeb")
+    ap.add_argument("-e", "--error", default="/var/log/bunkerweb/error.log", help="error.log (raisons des blocages)")
+    ap.add_argument("--docker", metavar="CONTENEUR", help="suit `docker logs -f CONTENEUR` (access + error)")
+    ap.add_argument("--demo", action="store_true", help="trafic et bans synthétiques, sans BunkerWeb")
+    ap.add_argument("--backlog", type=int, default=5000, help="lignes d'historique à relire par fichier (défaut 5000)")
+    ap.add_argument("--block-status", default=",".join(map(str, DEFAULT_BLOCK_STATUS)),
+                    help="codes HTTP considérés comme 'bloqué' (défaut 403,429,444)")
+    ap.add_argument("--access-regex", help="regex perso avec groupes nommés ip, time, status [, host, req|method+path, size, ua]")
+    ap.add_argument("--dump-unmatched", metavar="FICHIER",
+                    help="écrit les lignes d'error.log avec une IP mais sans raison reconnue (pour affiner REASON_RULES)")
+    ap.add_argument("--keep-internal", action="store_true", help="ne pas ignorer les health-checks internes (UA/host bwapi)")
+    g = ap.add_argument_group("bans BunkerWeb (lus par défaut dans /etc/bunkerweb/variables.env)")
+    g.add_argument("--no-bans", action="store_true", help="désactive la vue Bans et l'unban")
+    g.add_argument("--bans-api", choices=("instance", "central"), default="instance",
+                   help="instance = API interne de BunkerWeb (comme bwcli, défaut) ; central = service bunkerweb-api")
+    g.add_argument("--bans-url", help="URL de l'API (défaut http://127.0.0.1:API_HTTP_PORT, ou :8888 en central)")
+    g.add_argument("--bans-host", help="en-tête Host (défaut API_SERVER_NAME, sinon bwapi)")
+    g.add_argument("--bans-token", help="jeton Bearer (défaut API_TOKEN)")
+    g.add_argument("--bans-interval", type=float, default=5.0, help="rafraîchissement des bans en secondes (défaut 5)")
+    g.add_argument("--unban-via", choices=("api", "bwcli"), default="api",
+                   help="api (défaut) ou bwcli : appelle `bwcli unban` (utile en multi-instances)")
+    g.add_argument("--insecure", action="store_true", help="ne pas vérifier le certificat TLS de l'API")
+    g.add_argument("--crowdsec-unban", action="store_true",
+                   help="démarre avec l'unban CrowdSec activé (bascule en direct avec C dans la vue Bans)")
+    g.add_argument("--cscli", default="cscli",
+                   help="commande cscli (défaut cscli ; ex. \"docker exec crowdsec cscli\")")
+    g.add_argument("--no-crowdsec", action="store_true", help="désactive complètement l'unban CrowdSec")
+    gf = ap.add_argument_group("exclusions ModSecurity (whitelist de faux positifs par $host)")
+    gf.add_argument("--no-exclusions", "--no-fp-config", dest="no_fp_config", action="store_true",
+                    help="désactive l'onglet ModSec et la whitelist")
+    gf.add_argument("--exclusions-backend", "--fp-backend", dest="fp_backend", choices=("auto", "api", "file"),
+                    default="auto",
+                    help="auto (défaut) : API si un token est dispo (bwtop.env), sinon fichier + restart ; "
+                         "api = force le plan de contrôle bunkerweb-api ; file = force les fichiers .conf")
+    gf.add_argument("--exclusions-config", "--fp-config", dest="fp_config", metavar="FICHIER",
+                    help="fichier lu pour le token API (défaut %s puis ~/.config/bwtop/bwtop.env) ; "
+                         "format CONFIG_API_URL=... et CONFIG_API_TOKEN=..." % BWTOP_ENV_SYSTEM)
+    gf.add_argument("--config-api-url", help="URL du plan de contrôle bunkerweb-api (défaut http://127.0.0.1:8888)")
+    gf.add_argument("--config-api-token", help="jeton Bearer du plan de contrôle (sinon lu dans bwtop.env)")
+    gf.add_argument("--save-api-token", "--fp-save-token", dest="fp_save_token", action="store_true",
+                    help="écrit --config-api-token (et --config-api-url) dans le fichier bwtop.env en 0600, puis quitte")
+    gf.add_argument("--modsec-dir", default=MODSEC_DIR,
+                    help="dossier des configs modsec pour le backend file (défaut %s)" % MODSEC_DIR)
+    gf.add_argument("--reload-cmd", default=None,
+                    help="commande de reload pour le backend file (défaut : systemctl restart bunkerweb-scheduler ; "
+                         "un simple reload ne réimporte pas les fichiers)")
+    gf.add_argument("--exclusions-interval", "--fp-interval", dest="fp_interval", type=float, default=20.0,
+                    help="rafraîchissement de la liste des exclusions en s (défaut 20)")
+    gf.add_argument("--selftest", "--fp-selftest", dest="fp_selftest", nargs="?", const="", metavar="HOST",
+                    help="diagnostic complet de bwtop (environnement, logs, bans, exclusions) et test réel "
+                         "de l'application ModSec sur tous les services, puis quitte ; HOST optionnel = filtre de résolution")
+    gf.add_argument("--no-apply-test", action="store_true",
+                    help="avec --selftest : ne pas écrire de témoin ni recharger le scheduler (diagnostic en lecture seule)")
+    gf.add_argument("--fp-apply-test", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--graph-max", type=float, metavar="REQ_S",
+                    help="échelle fixe du graphe en req/s (sinon calibrée au démarrage puis figée ; +/- en direct)")
+    ap.add_argument("--setup", "--reconfigure", "--wizard", dest="setup", action="store_true",
+                    help="(re)lance l'assistant de configuration (backend d'exclusion, token API, CrowdSec) puis quitte")
+    ap.add_argument("--config", help="fichier de configuration (défaut ~/.config/bwtop/config.json)")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("-V", "--version", action="version", version="bwtop " + VERSION)
+    args = ap.parse_args()
+
+    if args.setup:
+        sys.exit(run_wizard(args, explicit=True))
+
+    if args.fp_save_token:
+        if not args.config_api_token:
+            ap.error("--save-api-token nécessite --config-api-token")
+        path = args.fp_config or BWTOP_ENV_SYSTEM
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("# bwtop : accès au plan de contrôle bunkerweb-api\n")
+                f.write("CONFIG_API_URL=%s\n" % (args.config_api_url or "http://127.0.0.1:8888"))
+                f.write("CONFIG_API_TOKEN=%s\n" % args.config_api_token)
+            os.chmod(path, 0o600)
+            print("Token enregistré dans %s (droits 0600)." % path)
+            print("bwtop utilisera désormais l'API par défaut. Teste : sudo %s --selftest" % os.path.basename(sys.argv[0]))
+            sys.exit(0)
+        except OSError as e:
+            sys.exit("bwtop: écriture de %s impossible : %s" % (path, e))
+
+    if args.fp_selftest is not None:
+        sys.exit(selftest(args))
+
+    # Premier lancement : si aucune config n'existe encore et qu'on est dans un vrai terminal
+    # interactif (pas un pipe/cron/docker/demo), on propose l'assistant automatiquement.
+    if (not args.demo and args.source != "-" and not args.docker
+            and sys.stdin.isatty() and sys.stdout.isatty()):
+        try:
+            _cfgp, _ = config_path(args.config)
+            _first = load_config(_cfgp).get("setup", 0) < 1
+        except Exception:
+            _first = False
+        if _first:
+            print("Aucune configuration trouvée — premier lancement de bwtop.\n")
+            run_wizard(args, explicit=False)
+            print("Démarrage de bwtop…\n")
+
+    try:
+        bstat = [int(x) for x in args.block_status.split(",") if x.strip()]
+    except ValueError:
+        ap.error("--block-status : liste de codes séparés par des virgules")
+    rx = re.compile(args.access_regex) if args.access_regex else None
+
+    q = queue.Queue(maxsize=200_000)
+    eng = Engine(q, bstat, rx, args.dump_unmatched, args.keep_internal)
+    stop = threading.Event()
+    threads = []
+
+    def spawn(fn, *a):
+        t = threading.Thread(target=fn, args=a, daemon=True)
+        t.start()
+        threads.append(t)
+
+    if args.demo:
+        label = "DEMO"
+        spawn(demo_feed, q, stop)
+    elif args.source == "-":
+        label = "stdin"
+        pipe = os.fdopen(os.dup(0), "r", encoding="utf-8", errors="replace")
+        try:                                   # le clavier vient du terminal, pas du pipe
+            tty = os.open("/dev/tty", os.O_RDONLY)
+            os.dup2(tty, 0)
+        except OSError:
+            sys.exit("bwtop: impossible d'ouvrir /dev/tty pour le clavier")
+        spawn(stdin_follow, pipe, q, stop)
+    elif args.docker:
+        label = "docker:" + args.docker
+        spawn(docker_follow, args.docker, q, args.backlog, eng.notes, stop)
+    else:
+        label = "%s + %s" % (os.path.basename(args.access), os.path.basename(args.error))
+        for p in (args.access, args.error):
+            spawn(tail_file, p, q, args.backlog, eng.notes, stop)
+
+    bans = None
+    client = build_ban_client(args, eng)
+    if client is not None:
+        cs = None
+        if not args.no_crowdsec:
+            cs = DemoCrowdSec(client) if isinstance(client, DemoBans) else CrowdSecCli(args.cscli)
+        bans = BanManager(client, args.bans_interval, cs)
+        spawn(bans.run, stop)
+
+    configmgr = None
+    backend = build_config_backend(args, client)
+    if backend is not None:
+        configmgr = ConfigManager(backend, args.fp_interval)
+        spawn(configmgr.run, stop)
+
+    cfg_path, cfg_owner = config_path(args.config)
+    cfg = load_config(cfg_path)
+    if args.crowdsec_unban:
+        cfg["crowdsec_unban"] = True
+    if args.graph_max:
+        cfg["graph_max"] = args.graph_max
+
+    locale.setlocale(locale.LC_CTYPE, "")      # UTF-8 pour les caracteres de dessin
+    ensure_terminfo()
+    try:
+        curses.wrapper(run, eng, label, not args.no_color, bans, cfg, cfg_path, cfg_owner, configmgr)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for p in _procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+
+
+if __name__ == "__main__":
+    main()
