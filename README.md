@@ -52,6 +52,8 @@ installé sur la machine cible.
   site, méthode, taille, user-agent, URL), largeur et ordre réglables.
 - **Filtre global par service** (`/`) : restreint l'ensemble du tableau de bord
   à un seul site, avec auto-complétion des services vus et bandeau d'état.
+- **Graphes système** optionnels (`S`) : CPU par cœur, RAM et débit réseau
+  (up/down) de la machine locale, lus dans `/proc` sans dépendance.
 - **Vue Bans** : liste les bans actifs (portée, site, raison, date, temps
   restant, pays), **unban** d'un ban ou de toutes les portées d'une IP,
   filtre et tri.
@@ -141,8 +143,9 @@ Bascule avec `Tab` ou les touches `1` / `2` / `3`. `h` ouvre l'aide, `q` quitte.
 
 ### 1 — Dashboard
 `p` pause · `w` fenêtre (1 m→5 m→15 m→1 h) · `b` bloquées seulement ·
-`/` **filtrer tout le tableau sur un service** · `c`/`F2` colonnes ·
-`+`/`-` échelle du graphe · `i`/`v` panneaux · `r` reset · `↑↓ PgUp/PgDn` défiler.
+`/` **filtrer tout le tableau sur un service** · `S` **graphes système** ·
+`n` interface réseau · `c`/`F2` colonnes · `+`/`-` échelle du graphe ·
+`i`/`v` panneaux · `r` reset · `↑↓ PgUp/PgDn` défiler.
 
 Le filtre `/` applique un **filtre global par service** : tout le tableau de
 bord (compteurs, codes, raisons, graphe, flux) ne reflète alors que le service
@@ -151,6 +154,15 @@ de temps active (`↹` pour parcourir les propositions), sans bloquer la frappe
 si aucun trafic n'a encore été vu — on peut valider un nom au clavier avec
 `Entrée`. Le service actif s'affiche dans un **bandeau bien visible** en haut
 de l'écran ; `Échap` (ou `/` puis `Entrée` à vide) retire le filtre.
+
+La touche `S` affiche/masque une **rangée de graphes système** (lus dans
+`/proc`, sans dépendance) : **CPU par cœur**, **RAM**, et **débit réseau**
+(montée/descente). Ces graphes mesurent la machine **qui exécute bwtop** (en
+général le serveur BunkerWeb lui-même). L'interface réseau est par défaut celle
+de la **route par défaut** ; `n` passe d'une interface physique à l'autre (les
+interfaces virtuelles `lo`/`docker*`/`veth*`/`br-*` sont ignorées), ou on la fixe
+avec `--net-iface eth0`. L'état (affiché/masqué) et l'interface choisie sont
+mémorisés dans `config.json`.
 
 ### 2 — Bans
 `↑↓` choisir · `u` débannir · `U` débannir l'IP partout ·
@@ -258,7 +270,7 @@ contre **ton** site et vérifie que chacune est bloquée (403/429/444).
 
 | Fichier | Rôle | Droits |
 |---|---|---|
-| `~/.config/bwtop/config.json` | préférences (colonnes, échelle du graphe, unban CrowdSec, marqueur d'installation) | 0644 |
+| `~/.config/bwtop/config.json` | préférences (colonnes, échelle du graphe, unban CrowdSec, graphes système + interface réseau, marqueur d'installation) | 0644 |
 | `/etc/bwtop/bwtop.env` (ou `~/.config/bwtop/bwtop.env`) | accès au plan de contrôle : `CONFIG_API_URL`, `CONFIG_API_TOKEN` | **0600** |
 
 Sous `sudo`, le `config.json` est écrit dans le home de l'utilisateur d'origine.
@@ -282,6 +294,8 @@ Les secrets restent dans `bwtop.env` (0600), jamais dans `config.json`.
 | `--dump-unmatched F` | journalise les lignes d'erreur sans raison reconnue |
 | `--keep-internal` | ne pas ignorer les health-checks internes (`bwapi`) |
 | `--graph-max REQ_S` | échelle fixe du graphe en req/s |
+| `--sys-graphs` | affiche d'emblée les graphes système (sinon touche `S`) |
+| `--net-iface IFACE` | interface réseau pour le graphe de débit (défaut : route par défaut) |
 | `--setup` / `--reconfigure` / `--wizard` | (re)lance l'assistant |
 | `--config FICHIER` | chemin du config.json |
 | `--no-color` | désactive la couleur |

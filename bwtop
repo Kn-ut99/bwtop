@@ -31,7 +31,7 @@ import threading
 import time
 from datetime import datetime
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 
 WINDOWS = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)]
 RETENTION = 3600            # on garde 1h d'evenements en memoire
@@ -1609,7 +1609,8 @@ def config_path(override=None):
 
 def load_config(path):
     import json
-    cfg = {"columns": default_columns(), "crowdsec_unban": False, "graph_max": None, "setup": 0}
+    cfg = {"columns": default_columns(), "crowdsec_unban": False, "graph_max": None, "setup": 0,
+           "sys_graphs": False, "net_iface": None}
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -1632,6 +1633,9 @@ def load_config(path):
         gm = data.get("graph_max")
         cfg["graph_max"] = gm if isinstance(gm, (int, float)) and gm > 0 else None
         cfg["setup"] = int(data.get("setup", 0) or 0)
+        cfg["sys_graphs"] = bool(data.get("sys_graphs", False))
+        ni = data.get("net_iface")
+        cfg["net_iface"] = ni if isinstance(ni, str) and ni else None
     except (OSError, ValueError, TypeError, AttributeError):
         pass
     return cfg
@@ -1646,6 +1650,7 @@ def save_config(path, owner, cfg):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"version": 1, "setup": int(cfg.get("setup", 0) or 0),
                        "crowdsec_unban": bool(cfg.get("crowdsec_unban")), "graph_max": cfg.get("graph_max"),
+                       "sys_graphs": bool(cfg.get("sys_graphs")), "net_iface": cfg.get("net_iface"),
                        "columns": cfg["columns"]}, f, indent=2, ensure_ascii=False)
         os.replace(tmp, path)
         if owner:
@@ -1738,6 +1743,198 @@ def hbar(frac, width):
     return "█" * full + (PART[part] if part and full < width else "")
 
 
+# --------------------------------------------------------------------------- #
+#  Graphes système (CPU / RAM / réseau) — lecture de /proc, zéro dépendance
+# --------------------------------------------------------------------------- #
+
+VIRT_IF_PREFIXES = ("docker", "veth", "br-", "virbr", "vmnet", "tap", "tun",
+                    "kube", "cni", "flannel", "cali", "nerdctl", "dummy", "ifb")
+
+
+def _readproc(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def default_route_iface():
+    """Interface de la route par défaut (destination 0.0.0.0) via /proc/net/route."""
+    for ln in _readproc("/proc/net/route").splitlines()[1:]:
+        f = ln.split()
+        if len(f) >= 2 and f[1] == "00000000":
+            return f[0]
+    return None
+
+
+def list_net_ifaces(real_only=True):
+    """Interfaces vues dans /proc/net/dev (sans lo ni interfaces virtuelles par défaut)."""
+    names = []
+    for ln in _readproc("/proc/net/dev").splitlines():
+        if ":" not in ln:
+            continue
+        name = ln.split(":", 1)[0].strip()
+        if not name:
+            continue
+        if real_only and (name == "lo" or name.startswith(VIRT_IF_PREFIXES)):
+            continue
+        names.append(name)
+    return names
+
+
+class SysSampler(threading.Thread):
+    """Échantillonne CPU (par cœur), RAM et débit réseau de la machine locale.
+
+    Lit uniquement /proc ; la machine mesurée est celle qui exécute bwtop
+    (en général le serveur BunkerWeb).
+    """
+    def __init__(self, iface=None, interval=1.0, hist=240):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self._stop = threading.Event()
+        self.lock = threading.Lock()
+        self.ok = os.path.exists("/proc/stat")
+        self.explicit = bool(iface)              # interface imposée (CLI/config) : pas d'auto
+        self.iface = iface or default_route_iface()
+        self.ncpu = 0
+        self.cpu = []                            # % par cœur (dernier échantillon)
+        self.cpu_avg = 0.0
+        self.cpu_hist = collections.deque(maxlen=hist)
+        self.mem_total_kb = 0
+        self.mem_used_kb = 0
+        self.mem_pct = 0.0
+        self.mem_hist = collections.deque(maxlen=hist)
+        self.up = 0.0
+        self.dn = 0.0
+        self.up_hist = collections.deque(maxlen=hist)
+        self.dn_hist = collections.deque(maxlen=hist)
+        self.err = None
+        self._pcpu = {}                          # clé cœur -> (idle, total)
+        self._pnet = None                        # (monotonic, rx, tx)
+
+    def stop(self):
+        self._stop.set()
+
+    def set_iface(self, name):
+        with self.lock:
+            self.iface = name
+            self.explicit = True
+            self._pnet = None
+            self.up = self.dn = 0.0
+            self.up_hist.clear()
+            self.dn_hist.clear()
+
+    def run(self):
+        if not self.ok:
+            self.err = "/proc indisponible (OS non Linux ?)"
+            return
+        while True:
+            try:
+                self._sample()
+            except Exception as e:
+                self.err = "%s: %s" % (type(e).__name__, e)
+            if self._stop.wait(self.interval):
+                return
+
+    def _sample(self):
+        self._sample_cpu()
+        self._sample_mem()
+        self._sample_net()
+
+    def _sample_cpu(self):
+        pcts, avg = {}, None
+        for ln in _readproc("/proc/stat").splitlines():
+            if not ln.startswith("cpu"):
+                continue
+            f = ln.split()
+            key = f[0]
+            per_core = len(key) > 3 and key[3:].isdigit()
+            if key != "cpu" and not per_core:
+                continue
+            nums = [int(x) for x in f[1:] if x.lstrip("-").isdigit()]
+            if len(nums) < 4:
+                continue
+            idle = nums[3] + (nums[4] if len(nums) > 4 else 0)   # idle + iowait
+            total = sum(nums)
+            pidle, ptotal = self._pcpu.get(key, (0, 0))
+            self._pcpu[key] = (idle, total)
+            dt = total - ptotal
+            pct = 100.0 * (dt - (idle - pidle)) / dt if dt > 0 else 0.0
+            pct = max(0.0, min(100.0, pct))
+            if key == "cpu":
+                avg = pct
+            else:
+                pcts[int(key[3:])] = pct
+        with self.lock:
+            if pcts:
+                self.ncpu = max(pcts) + 1
+                self.cpu = [pcts.get(i, 0.0) for i in range(self.ncpu)]
+            if avg is not None:
+                self.cpu_avg = avg
+                self.cpu_hist.append(avg)
+
+    def _sample_mem(self):
+        mt = ma = None
+        for ln in _readproc("/proc/meminfo").splitlines():
+            if ln.startswith("MemTotal:"):
+                mt = int(ln.split()[1])
+            elif ln.startswith("MemAvailable:"):
+                ma = int(ln.split()[1])
+            if mt is not None and ma is not None:
+                break
+        if mt:
+            used = mt - (ma if ma is not None else mt)
+            with self.lock:
+                self.mem_total_kb = mt
+                self.mem_used_kb = max(0, used)
+                self.mem_pct = 100.0 * self.mem_used_kb / mt
+                self.mem_hist.append(self.mem_pct)
+
+    def _sample_net(self):
+        ifc = self.iface
+        if not ifc:
+            return
+        rx = tx = None
+        for ln in _readproc("/proc/net/dev").splitlines():
+            if ":" not in ln:
+                continue
+            name, rest = ln.split(":", 1)
+            if name.strip() != ifc:
+                continue
+            f = rest.split()
+            if len(f) >= 9:
+                rx, tx = int(f[0]), int(f[8])
+            break
+        if rx is None:
+            return
+        now = time.monotonic()
+        if self._pnet:
+            pt, prx, ptx = self._pnet
+            dt = now - pt
+            if dt > 0:
+                up = max(0.0, (tx - ptx) / dt)       # octets/s émis
+                dn = max(0.0, (rx - prx) / dt)       # octets/s reçus
+                with self.lock:
+                    self.up, self.dn = up, dn
+                    self.up_hist.append(up)
+                    self.dn_hist.append(dn)
+        self._pnet = (now, rx, tx)
+
+    def snap(self):
+        """Copie cohérente des mesures pour l'affichage."""
+        with self.lock:
+            return {
+                "ncpu": self.ncpu, "cpu": list(self.cpu), "cpu_avg": self.cpu_avg,
+                "cpu_hist": list(self.cpu_hist),
+                "mem_total_kb": self.mem_total_kb, "mem_used_kb": self.mem_used_kb,
+                "mem_pct": self.mem_pct, "mem_hist": list(self.mem_hist),
+                "up": self.up, "dn": self.dn,
+                "up_hist": list(self.up_hist), "dn_hist": list(self.dn_hist),
+                "iface": self.iface, "err": self.err,
+            }
+
+
 class UI:
     MID_VIEWS = [("Top IPs bloquées", "c_bip"), ("Top clients (tous)", "c_ip")]
     RIGHT_VIEWS = [("URLs ciblées (bloquées)", "c_burl"), ("Règles ModSecurity", "c_rule"),
@@ -1781,6 +1978,10 @@ class UI:
         self.gmax = self.cfg.get("graph_max")   # echelle fixe du graphe (req/s) ; None = a calibrer
         self.t0 = time.monotonic()
         self._ipw = (15, 0.0)
+        self.sysrow = bool(self.cfg.get("sys_graphs"))   # rangée de graphes système (CPU/RAM/réseau)
+        self.sampler = None
+        if self.sysrow:
+            self._ensure_sampler()
         self.attr = {}
         curses.curs_set(0)
         if color and curses.has_colors():
@@ -1968,8 +2169,8 @@ class UI:
                     "  r rafraîchir  Tab/1 dashboard  h aide  q quitter" % ("ON→off" if self.cs_on else "off→ON"))
             self.put(h - 1, 0, keys.ljust(w - 1), curses.A_DIM)
             return
-        keys = (" q quitter  Tab bans  / filtrer service  c colonnes  +/- échelle  p pause  w fenêtre"
-                "  b bloquées  i/v panneaux  r reset  h aide")
+        keys = (" q quitter  Tab bans  / filtrer service  S graphes système  c colonnes  +/- échelle"
+                "  p pause  w fenêtre  b bloquées  i/v panneaux  r reset  h aide")
         note = " ".join(str(v) for v in e.notes.values() if v)
         self.put(h - 1, 0, (note or keys).ljust(w - 1), self.attr[C_WARN] if note else curses.A_DIM)
 
@@ -1980,10 +2181,14 @@ class UI:
         avail = h - 2 - banner_h
         top_h = 8
         mid_h = 8 if avail >= 30 else 6
-        feed_h = avail - top_h - mid_h
-        if feed_h < 5:
+        sys_h = 7 if self.sysrow else 0
+        feed_h = avail - top_h - mid_h - sys_h
+        if feed_h < 5 and mid_h:                        # on sacrifie d'abord le panneau du milieu
             mid_h = 0
-            feed_h = avail - top_h
+            feed_h = avail - top_h - sys_h
+        if feed_h < 5 and sys_h:                        # puis la rangée système si l'écran est vraiment court
+            sys_h = 0
+            feed_h = avail - top_h - mid_h
         y = 1
         if banner_h:                                    # filtre service : banniere tres visible en haut
             hint = "  / modifier · Échap effacer "
@@ -2058,6 +2263,10 @@ class UI:
                         colors=lambda k, i: C_MAG if a3 == "c_rule" else C_TITLE, right="[v]")
             y += mid_h
 
+        if sys_h:
+            self.draw_sysrow(y, sys_h, w)
+            y += sys_h
+
         self.draw_feed(y, feed_h, w)
 
     def draw_graph(self, y, x, gw, rq, bl):
@@ -2109,6 +2318,132 @@ class UI:
         err = save_config(self.cfg_path, self.cfg_owner, self.cfg) if self.cfg_path else None
         self.flash = (time.monotonic(), "Échelle du graphe : 0 – %s req/s%s" % (
             fmt_rate(self.gmax), (" (non enregistrée : %s)" % err) if err else " (enregistrée)"), not err)
+
+    # -- graphes système ---------------------------------------------------------
+    def _ensure_sampler(self):
+        if self.sampler is None:
+            self.sampler = SysSampler(self.cfg.get("net_iface"))
+            self.sampler.start()
+        return self.sampler
+
+    def _save_cfg(self, what):
+        err = save_config(self.cfg_path, self.cfg_owner, self.cfg) if self.cfg_path else None
+        return "%s (non enregistré : %s)" % (what, err) if err else "%s (enregistré)" % what, not err
+
+    def toggle_sysrow(self):
+        self.sysrow = not self.sysrow
+        self.cfg["sys_graphs"] = self.sysrow
+        if self.sysrow:
+            s = self._ensure_sampler()
+            if not s.ok:
+                self.flash = (time.monotonic(), "Graphes système indisponibles : %s" % (s.err or "/proc absent"), False)
+                self.sysrow = False
+                self.cfg["sys_graphs"] = False
+                return
+        msg, ok = self._save_cfg("Graphes système : %s" % ("affichés" if self.sysrow else "masqués"))
+        self.flash = (time.monotonic(), msg, ok)
+
+    def cycle_iface(self):
+        if not self.sysrow or self.sampler is None:
+            return
+        ifaces = list_net_ifaces()
+        if not ifaces:
+            self.flash = (time.monotonic(), "Aucune interface réseau physique détectée.", False)
+            return
+        cur = self.sampler.iface
+        try:
+            nxt = ifaces[(ifaces.index(cur) + 1) % len(ifaces)]
+        except ValueError:
+            nxt = ifaces[0]
+        self.sampler.set_iface(nxt)
+        self.cfg["net_iface"] = nxt
+        msg, ok = self._save_cfg("Interface réseau : %s" % nxt)
+        self.flash = (time.monotonic(), msg, ok)
+
+    def draw_sysrow(self, y, hh, w):
+        s = self.sampler.snap() if self.sampler else None
+        w1 = w // 3
+        w2 = w // 3
+        w3 = w - w1 - w2
+        self._draw_cpu_box(y, 0, hh, w1, s)
+        self._draw_mem_box(y, w1, hh, w2, s)
+        self._draw_net_box(y, w1 + w2, hh, w3, s)
+
+    def _spark_row(self, yy, x, width, series, scale, col):
+        """Trace une mini-courbe (une ligne) : une colonne par point, la plus récente à droite."""
+        if width <= 0:
+            return
+        data = series[-width:] if series else []
+        off = width - len(data)
+        sc = scale if scale > 0 else 1.0
+        for i, v in enumerate(data):
+            lvl = int(round(min(1.0, v / sc) * 8))
+            if lvl <= 0:
+                continue
+            self.put(yy, x + off + i, SPARK[min(8, lvl)], self.attr[col], 1)
+
+    def _draw_cpu_box(self, y, x, hh, bw, s):
+        self.box(y, x, hh, bw, "CPU")
+        iw = bw - 4
+        bar_rows = max(1, hh - 3)                        # dernière ligne intérieure = libellé
+        if not s or not s["cpu"]:
+            self.put(y + 1, x + 2, "mesure en cours…" if s else "indisponible", curses.A_DIM, iw)
+            return
+        cpu = s["cpu"]
+        # une colonne par cœur ; si trop de cœurs pour la largeur, on agrège par paquets
+        ncol = max(1, min(len(cpu), iw))
+        groups = [cpu[i * len(cpu) // ncol:(i + 1) * len(cpu) // ncol] or [0.0] for i in range(ncol)]
+        vals = [sum(g) / len(g) for g in groups]
+        for i, v in enumerate(vals):
+            col = C_OK if v < 50 else C_WARN if v < 85 else C_BAD
+            units = int(round(v / 100.0 * bar_rows * 8))
+            for r in range(bar_rows):
+                fill = max(0, min(8, units - (bar_rows - 1 - r) * 8))
+                if fill:
+                    self.put(y + 1 + r, x + 2 + i, SPARK[fill], self.attr[col], 1)
+        lab = "%d cœurs · moy %.0f%%" % (s["ncpu"], s["cpu_avg"])
+        if len(cpu) != ncol:
+            lab += " · %d barres" % ncol
+        self.put(y + hh - 2, x + 2, lab, curses.A_DIM, iw)
+
+    def _draw_mem_box(self, y, x, hh, bw, s):
+        self.box(y, x, hh, bw, "RAM")
+        iw = bw - 4
+        if not s or not s["mem_total_kb"]:
+            self.put(y + 1, x + 2, "mesure en cours…" if s else "indisponible", curses.A_DIM, iw)
+            return
+        pct = s["mem_pct"]
+        col = C_OK if pct < 60 else C_WARN if pct < 85 else C_BAD
+        used_gb = s["mem_used_kb"] / 1048576.0
+        tot_gb = s["mem_total_kb"] / 1048576.0
+        self.put(y + 1, x + 2, "%.1f / %.1f Gio" % (used_gb, tot_gb), curses.A_BOLD, iw - 5)
+        self.put(y + 1, x + bw - 2 - 4, "%3.0f%%" % pct, self.attr[col] | curses.A_BOLD)
+        self.put(y + 2, x + 2, hbar(pct / 100.0, iw).ljust(iw), self.attr[col], iw)
+        if hh >= 6:
+            self.put(y + 3, x + 2, "historique", curses.A_DIM, iw)
+            self._spark_row(y + hh - 2, x + 2, iw, s["mem_hist"], 100.0, col)
+
+    def _draw_net_box(self, y, x, hh, bw, s):
+        self.box(y, x, hh, bw, "Réseau", "[n]")
+        iw = bw - 4
+        if not s or s.get("err"):
+            self.put(y + 1, x + 2, (s["err"] if s and s.get("err") else "mesure en cours…"), curses.A_DIM, iw)
+            return
+        if not s["iface"]:
+            self.put(y + 1, x + 2, "aucune interface — route par défaut introuvable", curses.A_DIM, iw)
+            self.put(y + 2, x + 2, "n : choisir une interface", curses.A_DIM, iw)
+            return
+        self.put(y + 1, x + 2, elide(s["iface"], iw), curses.A_DIM, iw)
+        half = iw // 2
+        self.put(y + 2, x + 2, "↑ %s/s" % fmt_b(s["up"]), self.attr[C_INFO] | curses.A_BOLD, half)
+        self.put(y + 2, x + 2 + half, "↓ %s/s" % fmt_b(s["dn"]), self.attr[C_OK] | curses.A_BOLD, iw - half)
+        scale = max([1.0] + list(s["up_hist"][-iw:]) + list(s["dn_hist"][-iw:]))
+        if hh >= 6:
+            self.put(y + 3, x + 2, "↑", self.attr[C_INFO], 1)
+            self._spark_row(y + 3, x + 4, iw - 2, s["up_hist"], scale, C_INFO)
+            self.put(y + 4, x + 2, "↓", self.attr[C_OK], 1)
+            self._spark_row(y + 4, x + 4, iw - 2, s["dn_hist"], scale, C_OK)
+            self.put(y + hh - 2, x + 2, "max %s/s" % fmt_b(scale), curses.A_DIM, iw)
 
     # -- flux : colonnes configurables -------------------------------------------
     def ip_width(self, ips):
@@ -2586,6 +2921,8 @@ class UI:
             ("+ / -        échelle fixe du graphe (1, 2, 5, 10, 20, 50… req/s)", 0),
             ("/            filtrer tout le tableau sur un service", 0),
             ("             (↹ auto-complète les services vus ; Entrée valide ; Échap efface)", curses.A_DIM),
+            ("S            afficher / masquer les graphes système (CPU, RAM, réseau)", 0),
+            ("n            changer d'interface réseau (quand les graphes sont affichés)", 0),
             ("i / v        changer les panneaux du milieu / de droite", 0),
             ("r            remettre les compteurs à zéro", 0),
             ("↑ ↓ PgUp PgDn Home/End   défiler le flux", 0),
@@ -2820,6 +3157,10 @@ class UI:
             self.mid_view = (self.mid_view + 1) % len(self.MID_VIEWS)
         elif k == ord("v"):
             self.right_view = (self.right_view + 1) % len(self.RIGHT_VIEWS)
+        elif k in (ord("S"),):
+            self.toggle_sysrow()
+        elif k in (ord("n"), ord("N")):
+            self.cycle_iface()
         elif k in (ord("r"), ord("R")):
             e.reset()
             e.set_window(e.window_secs)
@@ -2969,21 +3310,27 @@ def run(scr, eng, source_label, color, bans, cfg, cfg_path, cfg_owner, configmgr
     ui = UI(scr, eng, source_label, color, bans, cfg, cfg_path, cfg_owner, configmgr)
     last = 0.0
     dirty = True
-    while True:
-        eng.pump()
-        scr.timeout(15 if not eng.q.empty() else 120)
-        k = read_key(scr)
-        if k != -1:
-            if k == curses.KEY_RESIZE:
-                dirty = True
-            elif not ui.key(k):
-                return
-            else:
-                dirty = True
-        now = time.time()
-        if (dirty or now - last >= 0.5) and (not ui.paused or dirty):
-            ui.draw()
-            last, dirty = now, False
+    try:
+        while True:
+            eng.pump()
+            # rafraîchi 1 Hz pour les graphes système même sans trafic ni touche
+            idle_to = 1000 if ui.sysrow else 120
+            scr.timeout(15 if not eng.q.empty() else idle_to)
+            k = read_key(scr)
+            if k != -1:
+                if k == curses.KEY_RESIZE:
+                    dirty = True
+                elif not ui.key(k):
+                    return
+                else:
+                    dirty = True
+            now = time.time()
+            if (dirty or now - last >= 0.5) and (not ui.paused or dirty):
+                ui.draw()
+                last, dirty = now, False
+    finally:
+        if ui.sampler is not None:
+            ui.sampler.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -3547,6 +3894,10 @@ def main():
     gf.add_argument("--fp-apply-test", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--graph-max", type=float, metavar="REQ_S",
                     help="échelle fixe du graphe en req/s (sinon calibrée au démarrage puis figée ; +/- en direct)")
+    ap.add_argument("--sys-graphs", action="store_true",
+                    help="affiche d'emblée les graphes système (CPU/RAM/réseau) ; sinon touche S en direct")
+    ap.add_argument("--net-iface", metavar="IFACE",
+                    help="interface réseau pour le graphe de débit (défaut : route par défaut ; n pour changer)")
     ap.add_argument("--setup", "--reconfigure", "--wizard", dest="setup", action="store_true",
                     help="(re)lance l'assistant de configuration (backend d'exclusion, token API, CrowdSec) puis quitte")
     ap.add_argument("--config", help="fichier de configuration (défaut ~/.config/bwtop/config.json)")
@@ -3649,6 +4000,10 @@ def main():
         cfg["crowdsec_unban"] = True
     if args.graph_max:
         cfg["graph_max"] = args.graph_max
+    if args.sys_graphs:
+        cfg["sys_graphs"] = True
+    if args.net_iface:
+        cfg["net_iface"] = args.net_iface
 
     locale.setlocale(locale.LC_CTYPE, "")      # UTF-8 pour les caracteres de dessin
     ensure_terminfo()
