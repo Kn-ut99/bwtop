@@ -304,8 +304,6 @@ Les secrets restent dans `bwtop.env` (0600), jamais dans `config.json`.
 | `--selftest [HOST]` | diagnostic complet puis quitte |
 | `--no-apply-test` | selftest en lecture seule |
 
-> Les anciens noms d'options (`--fp-backend`, `--no-fp-config`, …) restent
-> acceptés comme alias.
 
 ---
 
@@ -327,7 +325,7 @@ Les secrets restent dans `bwtop.env` (0600), jamais dans `config.json`.
 
 ## Licence
 
-[MIT](LICENSE) — « le moins de restriction possible ».
+[MIT](LICENSE)
 
 ---
 
