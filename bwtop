@@ -10,7 +10,7 @@ Sources de logs possibles :
   * demo       : bwtop --demo        (trafic synthetique, pour tester l'affichage)
 
 Touches principales : Tab bascule Dashboard <-> Bans (unban avec u), c configure les colonnes,
-h affiche l'aide. Les bans sont lus via l'API interne de BunkerWeb (la meme que bwcli), dont
+fleches = selectionner une requete du flux (Entree : fiche detail), h affiche l'aide. Les bans sont lus via l'API interne de BunkerWeb (la meme que bwcli), dont
 l'adresse, le Host et le jeton sont lus dans /etc/bunkerweb/variables.env.
 
 Aucune dependance externe : Python 3.8+ et le module standard `curses`.
@@ -27,11 +27,12 @@ import random
 import re
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from datetime import datetime
 
-VERSION = "1.10.1"
+VERSION = "1.11.0"
 
 WINDOWS = [("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)]
 RETENTION = 3600            # on garde 1h d'evenements en memoire
@@ -39,6 +40,13 @@ MAX_EVENTS = 400_000        # garde-fou memoire
 RESOLVE_DELAY = 1.5         # s d'attente avant d'attribuer une raison a un blocage
 CORR_WINDOW = 5.0           # s de tolerance entre ligne access.log et error.log
 DEFAULT_BLOCK_STATUS = (403, 429, 444)
+# Longueurs conservees par champ (garde-fou memoire : jusqu'a MAX_EVENTS requetes en memoire).
+# Les requetes bloquees, peu nombreuses et inspectees dans la fiche detail, sont gardees
+# quasiment entieres ; les autorisees sont plafonnees plus bas.
+LIM_ALLOWED = {"path": 1024, "ua": 300, "ref": 300}
+LIM_BLOCKED = {"path": 8192, "ua": 1024, "ref": 1024}
+LIM_HOST = 253                  # longueur max d'un nom DNS
+LIM_ERRTXT = 400                # texte d'une ligne error.log conserve pour la fiche detail
 
 # --------------------------------------------------------------------------- #
 #  Parsing des logs
@@ -57,6 +65,7 @@ ACCESS_RE = re.compile(
 ERROR_RE = re.compile(r'^(?P<time>\d{4}/\d\d/\d\d \d\d:\d\d:\d\d) \[(?P<level>\w+)\] ')
 DOCKER_TS_RE = re.compile(r'^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d+)?(?:Z|[+-]\d\d:\d\d)? ')
 
+ERRMSG_RE = re.compile(r'^\S+ \S+ \[\w+\] \d+#\d+: (?:\*\d+ )?(?P<msg>.*?)(?:, client: |$)')
 IP_RE = re.compile(r'(?:client:? |\[client |\bIP |\bip |\bremote_addr:? )\[?([0-9a-fA-F:.]{3,45})')
 REQ_RE = re.compile(r'request: "[A-Z]+ (\S+) HTTP/[\d.]+"')
 URI_RE = re.compile(r'\[uri "([^"]*)"\]')
@@ -125,8 +134,18 @@ def clean(s, n):
     return _clean_re.sub("?", s[:n])
 
 
+def error_text(line):
+    """Message utile d'une ligne error.log (sans horodatage, pid ni suffixe client/server/request)."""
+    m = ERRMSG_RE.match(line)
+    return clean((m.group("msg") if m else line).strip(), LIM_ERRTXT)
+
+
 def classify_error(line):
-    """Retourne (ip, categorie, detail, deny, uri) ou None."""
+    """Retourne (ip, categorie, detail, deny, uri, info) ou None.
+
+    info = (id_regle, message complet) pour ModSecurity, ("", texte de la ligne) sinon :
+    sert a la fiche detail d'une requete (toutes les regles declenchees, cause complete).
+    """
     if WHITELIST_RE.search(line) and "blacklist" not in line.lower():
         return None
     mi = IP_RE.search(line)
@@ -146,11 +165,11 @@ def classify_error(line):
         detail = (rid + " " + msg).strip()
         if rid in ANOMALY_IDS and not deny:
             detail = ""
-        return ip, "modsecurity", clean(detail, 90), deny, uri
+        return ip, "modsecurity", clean(detail, 90), deny, uri, (rid, clean(msg, 512))
 
     for cat, rx in REASON_RULES:
         if rx.search(line):
-            return ip, cat, "", True, uri
+            return ip, cat, "", True, uri, ("", error_text(line))
     return None
 
 
@@ -159,8 +178,13 @@ def classify_error(line):
 # --------------------------------------------------------------------------- #
 
 class Ev:
+    # n     : numero de sequence (croissant) -> retrouver une requete dans le flux en O(log n)
+    # rules : requetes bloquees, [(id, message, deny), ...] regles ModSec correlees (score global inclus)
+    # note  : requetes bloquees hors ModSec, texte complet de la ligne error.log retenue
+    # ref, rqid : referer et $request_id (rqid conserve pour les seules requetes bloquees)
     __slots__ = ("ts", "ip", "method", "path", "status", "size", "ua",
-                 "blocked", "reason", "detail", "resolved", "inwin", "arr", "host")
+                 "blocked", "reason", "detail", "resolved", "inwin", "arr", "host",
+                 "n", "rules", "note", "ref", "rqid")
 
 
 def _bump(c, k, s):
@@ -403,20 +427,26 @@ class Engine:
         if not self.keep_internal and (g.get("ua") == "bwapi" or g.get("host") == "bwapi"):
             return                      # health-checks internes de BunkerWeb
         ev = Ev()
+        ev.blocked = status in self.block_status
+        lim = LIM_BLOCKED if ev.blocked else LIM_ALLOWED
         ev.ts, ev.ip, ev.status = ts, g["ip"], status
-        ev.method, ev.path = clean(method, 8), clean(path, 300)
+        ev.method, ev.path = clean(method, 8), clean(path, lim["path"])
         ev.size = int(size) if size and size.isdigit() else 0
-        ev.ua = clean(g.get("ua") or "", 120)
-        ev.host = clean((g.get("host") or "").lower(), 80)
+        ev.ua = clean(g.get("ua") or "", lim["ua"])
+        ref = g.get("ref")
+        ev.ref = clean(ref, lim["ref"]) if ref and ref != "-" else ""
+        ev.rqid = (g.get("rid") or "") if ev.blocked else ""
+        ev.host = clean((g.get("host") or "").lower(), LIM_HOST)
         if ev.host:
             self.seen_host = True
-        ev.blocked = status in self.block_status
         ev.reason = ev.detail = ""
+        ev.rules = ev.note = None
         ev.resolved = not ev.blocked
         ev.arr = time.monotonic()
         ev.inwin = ts >= time.time() - self.window_secs
 
         self.seq += 1
+        ev.n = self.seq
         self.tot_req += 1
         self.tot_bytes += ev.size
         self.events.append(ev)
@@ -439,12 +469,12 @@ class Engine:
                 self.dump.write(line + "\n")
                 self.dump.flush()
             return
-        ip, cat, detail, deny, uri = r
+        ip, cat, detail, deny, uri, info = r
         ts = hint if hint is not None else parse_err_time(me.group("time"))
         d = self.rindex.get(ip)
         if d is None:
             d = self.rindex[ip] = collections.deque(maxlen=40)
-        d.append((ts, cat, detail, deny, uri))
+        d.append((ts, cat, detail, deny, uri, info))
         if cat == "modsecurity":
             mid = ID_RE.search(line)
             rid = mid.group(1) if mid else ""
@@ -491,13 +521,24 @@ class Engine:
             exact = [c for c in cands if c[4] and c[4] == ev.path]
             if exact:
                 cands = exact
+            rules, seen = [], set()
+            for c in cands:                          # toutes les regles ModSec correlees, sans doublon
+                rid, msg = c[5]
+                if c[1] == "modsecurity" and rid and rid not in seen:
+                    seen.add(rid)
+                    rules.append((rid, msg, c[3]))
+            rules.sort(key=lambda r: r[0] in ANOMALY_IDS)   # regles precises d'abord, score global ensuite
             non_mod = [c for c in cands if c[1] != "modsecurity"]
             if non_mod:
+                # bloquee avant ModSecurity (blacklist, rate-limit...) : les regles vues pour
+                # cette IP concernent une autre requete, on ne les rattache pas
                 ev.reason, ev.detail = non_mod[-1][1], non_mod[-1][2]
+                ev.note = non_mod[-1][5][1] or None
             else:
                 specific = [c[2] for c in cands if c[2] and not c[3]]
                 ev.reason = "modsecurity"
                 ev.detail = specific[0] if specific else cands[-1][2]
+                ev.rules = rules or None
         else:
             ev.reason = {429: "rate-limit (429)", 444: "dropped (444)"}.get(
                 ev.status, "unknown (%d)" % ev.status)
@@ -588,11 +629,30 @@ class Engine:
         return sorted(s)
 
     def reason_of(self, ev):
+        """Raison complete (categorie + regle et message)."""
         if not ev.blocked:
             return ""
         if not ev.resolved:
             return "..."
         return ev.reason + (": " + ev.detail if ev.detail else "")
+
+
+_STATUS_SUFFIX_RE = re.compile(r' \(\d{3}\)$')
+
+
+def short_reason(ev):
+    """Raison compacte pour le flux : « modsec 942100 », « blacklist », « rate-limit »…
+
+    Le code HTTP est deja dans sa colonne ; le message complet est dans la fiche detail (Entrée).
+    """
+    if not ev.blocked:
+        return ""
+    if not ev.resolved:
+        return "…"
+    if ev.reason == "modsecurity":
+        rid = ev.detail.split(" ", 1)[0] if ev.detail else ""
+        return "modsec " + rid if rid.isdigit() else "modsec"
+    return _STATUS_SUFFIX_RE.sub("", ev.reason)
 
 
 # --------------------------------------------------------------------------- #
@@ -726,6 +786,21 @@ def demo_feed(q, stop):
         ("antibot", "", "", "/"),
         ("country", "", "", "/"),
     ]
+    # regles CRS supplementaires declenchees en meme temps (une requete en declenche souvent plusieurs)
+    extra_rules = {
+        "942100": [("942190", "Detects MSSQL code execution and information gathering attempts"),
+                   ("942430", "Restricted SQL Character Anomaly Detection (args): # of special characters exceeded (12)")],
+        "941100": [("941110", "XSS Filter - Category 1: Script Tag Vector"),
+                   ("941160", "NoScript XSS InjectionChecker: HTML Injection")],
+        "930100": [("930120", "OS File Access Attempt")],
+        "932160": [("932100", "Remote Command Execution: Unix Command Injection")],
+    }
+    long_tail = ("&utm_source=newsletter&utm_medium=email&utm_campaign=automne-2026&session="
+                 + "%032x" % rnd.getrandbits(128) + "&redirect=%2Fcompte%2Fcommandes%2Fhistorique%3Fpage%3D3")
+    long_ua = ("Mozilla/5.0 (Linux; Android 14; SM-S928B Build/UP1A.231005.007; wv) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Version/4.0 Chrome/126.0.6478.71 Mobile Safari/537.36 "
+               "[FB_IAB/FB4A;FBAV/471.0.0.35.86;]")
+    refs = ["-", "-", "-", "https://www.google.com/", "https://www.example.com/products"]
     t0 = time.time()
     burst_until, burst_ip = 0, None
     while not stop.is_set():
@@ -745,9 +820,12 @@ def demo_feed(q, stop):
                 ua = rnd.choice(bad_uas)
                 tail = ', client: %s, server: %s, request: "GET %s HTTP/1.1", host: "%s"' % (ip, h, uri, h)
                 if cat == "modsecurity":
-                    q.put(('%s [warn] 12#12: *%d ModSecurity: Warning. detected. [file "x.conf"] [line "46"] '
-                           '[id "%s"] [rev ""] [msg "%s"] [severity "2"] [hostname "10.0.0.5"] [uri "%s"] '
-                           '[unique_id "abc"]%s' % (errt, rnd.randint(1, 9999), rid, msg, uri.split("?")[0], tail), None))
+                    fired = [(rid, msg)] + [r for r in extra_rules.get(rid, []) if rnd.random() < 0.6]
+                    for frid, fmsg in fired:
+                        q.put(('%s [warn] 12#12: *%d ModSecurity: Warning. detected. [file "x.conf"] [line "46"] '
+                               '[id "%s"] [rev ""] [msg "%s"] [severity "2"] [hostname "10.0.0.5"] [uri "%s"] '
+                               '[unique_id "abc"]%s' % (errt, rnd.randint(1, 9999), frid, fmsg,
+                                                         uri.split("?")[0], tail), None))
                     q.put(('%s [error] 12#12: *%d [client %s] ModSecurity: Access denied with code 403 (phase 2). '
                            'Matched "Operator Ge" [file "y.conf"] [id "949110"] [msg "Inbound Anomaly Score Exceeded '
                            '(Total Score: 10)"] [uri "%s"]%s' % (errt, rnd.randint(1, 9999), ip, uri.split("?")[0], tail), None))
@@ -764,9 +842,11 @@ def demo_feed(q, stop):
             else:
                 ip = rnd.choice(good)
                 st = rnd.choices((200, 304, 301, 404, 500, 502), (80, 8, 3, 6, 1.2, 0.8))[0]
-                q.put(('%s %s - %032x - [%s] "%s %s HTTP/1.1" %d %d "-" "%s"' % (
+                page = rnd.choice(pages) + (("?ref=1" + long_tail) if rnd.random() < 0.05 else "")
+                q.put(('%s %s - %032x - [%s] "%s %s HTTP/1.1" %d %d "%s" "%s"' % (
                     h, ip, rnd.getrandbits(128), local, rnd.choices(("GET", "POST", "HEAD"), (85, 12, 3))[0],
-                    rnd.choice(pages), st, int(rnd.expovariate(1 / 12000)) + 200, rnd.choice(uas)), None))
+                    page, st, int(rnd.expovariate(1 / 12000)) + 200, rnd.choice(refs),
+                    long_ua if rnd.random() < 0.05 else rnd.choice(uas)), None))
         time.sleep(0.1)
 
 
@@ -1585,6 +1665,9 @@ COLDEF = collections.OrderedDict([
     ("url",    ("URL", 40, 10, 300)),
 ])
 DEFAULT_ON = {"time", "ip", "code", "reason", "host", "method", "url"}
+# Colonnes elastiques : leur largeur suit le contenu visible, la largeur configuree sert de maximum.
+ELASTIC = ("ip", "reason", "host")
+IP_AUTO_MAX = 24                # IP en largeur auto : au-dela, coupee au milieu (complete dans la fiche)
 
 
 def default_columns():
@@ -1955,8 +2038,10 @@ class UI:
         self.blocked_only = False
         self.mid_view = 0
         self.right_view = 0
-        self.scroll = 0
-        self.anchor = 0
+        self.sel = None                # requete selectionnee dans le flux ; None = mode live
+        self.top_ev = None             # requete affichee en haut du flux fige
+        self.feed_rows = 10            # hauteur utile du flux au dernier affichage (pour PgUp/PgDn)
+        self.evd_top = 0               # defilement de la fiche detail
         self.modal = None              # None | "help" | "cols" | ("confirm", [bans], texte) | ("info", texte) | ("filter", buf)
         self.col_cur = 0
         self.ban_cur = 0
@@ -1977,7 +2062,7 @@ class UI:
         self.cs_prev = {}              # ip -> ("loading"|"ok"|"err", decisions|message)
         self.gmax = self.cfg.get("graph_max")   # echelle fixe du graphe (req/s) ; None = a calibrer
         self.t0 = time.monotonic()
-        self._ipw = (15, 0.0)
+        self._autow = {}               # colonne elastique -> (largeur, instant du dernier elargissement)
         self.sysrow = bool(self.cfg.get("sys_graphs"))   # rangée de graphes système (CPU/RAM/réseau)
         self.sampler = None
         if self.sysrow:
@@ -2099,6 +2184,8 @@ class UI:
             self.draw_dialog(h, w)
         elif isinstance(m, tuple) and m[0] == "msdetail":
             self.draw_msdetail(h, w)
+        elif m == "evdetail":
+            self.draw_evdetail(h, w)
         s.refresh()
 
     def draw_header(self, w):
@@ -2170,8 +2257,12 @@ class UI:
                     "  r rafraîchir  Tab/1 dashboard  h aide  q quitter" % ("ON→off" if self.cs_on else "off→ON"))
             self.put(h - 1, 0, keys.ljust(w - 1), curses.A_DIM)
             return
-        keys = (" q quitter  Tab bans  / filtrer service  S graphes système  c colonnes  +/- échelle"
-                "  p pause  w fenêtre  b bloquées  i/v panneaux  r reset  h aide")
+        if self.sel is not None:
+            keys = (" ↑↓ choisir  Entrée détail  PgUp/PgDn page  Home plus ancienne  Échap/End live"
+                    "  b bloquées  / filtrer service  h aide  q quitter")
+        else:
+            keys = (" q quitter  Tab bans  ↑↓ sélection  / filtrer service  S graphes système  c colonnes"
+                    "  +/- échelle  p pause  w fenêtre  b bloquées  i/v panneaux  r reset  h aide")
         note = " ".join(str(v) for v in e.notes.values() if v)
         self.put(h - 1, 0, (note or keys).ljust(w - 1), self.attr[C_WARN] if note else curses.A_DIM)
 
@@ -2439,13 +2530,13 @@ class UI:
             self.put(y + hh - 2, x + 2, "max %s/s" % fmt_b(scale), curses.A_DIM, iw)
 
     # -- flux : colonnes configurables -------------------------------------------
-    def ip_width(self, ips):
-        cur, ts = self._ipw
-        new = max([len(i) for i in ips] + [7])
+    def elastic_width(self, cid, need):
+        """S'elargit tout de suite, ne retrecit qu'apres 30 s (evite que les colonnes sautent)."""
+        cur, ts = self._autow.get(cid, (need, 0.0))
         now = time.monotonic()
-        if new >= cur or now - ts > 30:               # s'elargit tout de suite, retrecit lentement
-            self._ipw = (new, now)
-            return new
+        if need >= cur or now - ts > 30:
+            self._autow[cid] = (need, now)
+            return need
         return cur
 
     def feed_layout(self, iw, evs):
@@ -2456,9 +2547,19 @@ class UI:
             cols = [{"id": "url", "on": True, "width": 40}]
         widths = []
         for c in cols[:-1]:
-            wd = c["width"]
-            if c["id"] == "ip" and wd == 0:
-                wd = min(39, self.ip_width([ev.ip for ev in evs]))
+            cid, wd = c["id"], c["width"]
+            if cid in ELASTIC:
+                hdr = len(COLDEF[cid][0])
+                if cid == "ip":
+                    need = max([len(ev.ip) for ev in evs] + [7])
+                    cap = IP_AUTO_MAX if wd == 0 else wd
+                elif cid == "reason":
+                    need = max([len(short_reason(ev)) for ev in evs] + [hdr])
+                    cap = wd
+                else:
+                    need = max([len(ev.host) for ev in evs] + [hdr])
+                    cap = wd
+                wd = min(cap, self.elastic_width(cid, need))
             widths.append(wd)
         last_min = COLDEF[cols[-1]["id"]][2]
         rem = iw - sum(widths) - len(widths)
@@ -2488,7 +2589,7 @@ class UI:
             return str(ev.status), self.attr[col] | curses.A_BOLD, False, False
         if cid == "reason":
             rc = REASON_COLOR.get(ev.reason, C_WARN) if ev.blocked else 0
-            return self.e.reason_of(ev), (self.attr[rc] if rc else 0), False, False
+            return short_reason(ev), (self.attr[rc] if rc else 0), False, False
         if cid == "host":
             return ev.host, self.attr[C_TITLE], False, False
         if cid == "method":
@@ -2509,23 +2610,72 @@ class UI:
         sub = [h for h in hosts if b in h.lower() and h not in pre]
         return pre + sub
 
-    def draw_feed(self, y, fh, w):
+    # -- flux : mode live / selection --------------------------------------------
+    def feed_src(self):
         e = self.e
-        title = "Requêtes en direct" + (" — bloquées seulement" if self.blocked_only else "")
-        self.box(y, 0, fh, w, title, ("↑↓ défiler" if self.scroll else "live") + " · c colonnes")
-        iw, rows = w - 4, fh - 3
         src = e.blocked_events if self.blocked_only else e.events
         if self.svc_filter:
             src = [ev for ev in src if ev.host == self.svc_filter]
-        off = self.scroll + ((e.seq - self.anchor) if self.scroll > 0 else 0)
+        return src
+
+    def _idx_of(self, src, n):
+        """Indice dans src de la requete de sequence n, ou de la plus proche plus ancienne (0 a defaut)."""
+        if not src:
+            return -1
+        if src is self.e.events:                     # sequence contigue : acces direct
+            return max(0, min(len(src) - 1, n - src[0].n))
+        lo, hi = 0, len(src) - 1
+        if src[lo].n > n:
+            return 0
+        while lo < hi:                               # dernier indice dont .n <= n
+            mid = (lo + hi + 1) // 2
+            if src[mid].n <= n:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
+    def go_live(self):
+        self.sel = self.top_ev = None
+
+    def sel_move(self, d):
+        """d > 0 : vers les plus recentes (haut du flux) ; d < 0 : vers les plus anciennes."""
+        src = self.feed_src()
+        if not src:
+            return
+        if self.sel is None:                         # 1re touche : on fige le flux sur la plus recente
+            self.sel = self.top_ev = src[-1]
+            return
+        i = self._idx_of(src, self.sel.n)
+        self.sel = src[max(0, min(len(src) - 1, i + d))]
+
+    def draw_feed(self, y, fh, w):
+        title = "Requêtes en direct" + (" — bloquées seulement" if self.blocked_only else "")
+        iw, rows = w - 4, fh - 3
+        self.feed_rows = max(1, rows)
+        src = self.feed_src()
         n = len(src)
-        off = max(0, min(off, max(0, n - rows)))
-        evs = []
-        for i in range(rows):
-            idx = n - 1 - off - i
-            if idx < 0:
-                break
-            evs.append(src[idx])
+        if n == 0 and self.sel is not None:
+            self.go_live()
+        if self.sel is None:
+            ti = n - 1
+            right = "live · ↑↓ sélectionner · c colonnes"
+        else:
+            si = self._idx_of(src, self.sel.n)
+            self.sel = src[si]                       # resynchronise (filtre change, requete expiree)
+            ti = self._idx_of(src, self.top_ev.n) if self.top_ev is not None else si
+            ti = max(ti, si)                         # la selection reste visible
+            if ti - si >= rows:
+                ti = si + rows - 1
+            ti = max(ti, min(n - 1, rows - 1))       # pas de trou en bas du cadre
+            self.top_ev = src[ti]
+            newer = n - 1 - ti
+            right = "SÉLECTION%s · Entrée détail · Échap live" % (
+                (" · +%s plus récentes" % fmt_n(newer)) if newer else "")
+        self.box(y, 0, fh, w, title, right)
+        if self.sel is not None:                     # titre du cadre mis en evidence quand le flux est fige
+            self.put(y, w - len(right) - 3, " %s " % right, self.attr[C_WARN] | curses.A_BOLD)
+        evs = [src[ti - i] for i in range(rows) if ti - i >= 0]
         layout = self.feed_layout(iw, evs)
         x = 2
         for cid, wd in layout:
@@ -2534,11 +2684,107 @@ class UI:
         for i, ev in enumerate(evs):
             yy = y + 2 + i
             x = 2
+            hl = curses.A_REVERSE if ev is self.sel else 0
+            if hl:
+                self.put(yy, 1, " " * (iw + 2), hl)
             for cid, wd in layout:
-                txt, a, mid, right = self.cell(cid, ev)
+                txt, a, mid, right_al = self.cell(cid, ev)
                 txt = elide(txt, wd, mid)
-                self.put(yy, x, txt.rjust(wd) if right else txt.ljust(wd), a, wd)
+                self.put(yy, x, txt.rjust(wd) if right_al else txt.ljust(wd), a | hl, wd)
                 x += wd + 1
+
+    # -- fiche detail d'une requete ------------------------------------------------
+    def evdetail_lines(self, ev, iw):
+        """Lignes (texte, attribut) de la fiche : toutes les proprietes, sans troncature."""
+        L = []
+        lw = 13
+        vw = max(10, iw - lw)
+
+        def field(label, value, attr=0, wrap=True):
+            value = value if value else "—"
+            parts = (textwrap.wrap(value, vw, break_long_words=True, break_on_hyphens=False,
+                                   drop_whitespace=False) or [""]) if wrap else [value]
+            for j, part in enumerate(parts):
+                L.append((((label if j == 0 else "").ljust(lw)) + part, attr if attr else 0, lw))
+
+        dt = datetime.fromtimestamp(ev.ts)
+        age = int(max(0, time.time() - ev.ts))
+        age = fmt_dur(age) if age >= 60 else age
+        tz = time.strftime("%z", time.localtime(ev.ts))
+        field("Date", "%s (UTC%s:%s) · il y a %s" % (
+            dt.strftime("%Y-%m-%d %H:%M:%S"), tz[:3], tz[3:], age if isinstance(age, str) else "%d s" % age))
+        ipv = ev.ip + (("  %s bannie" % BAN_MARK) if self.banned(ev.ip) else "")
+        field("IP", ipv, self.attr[C_BAD] | curses.A_BOLD if self.banned(ev.ip) else curses.A_BOLD)
+        field("Site", ev.host, self.attr[C_TITLE])
+        col = C_BAD if ev.blocked else (C_OK if ev.status < 300 else C_INFO if ev.status < 400
+                                        else C_WARN if ev.status < 500 else C_BAD)
+        field("Code", "%d%s · %s" % (ev.status, "  (bloquée)" if ev.blocked else "", fmt_b(ev.size)),
+              self.attr[col] | curses.A_BOLD)
+        field("Méthode", ev.method)
+        field("URL", ev.path)
+        field("Référent", ev.ref)
+        field("User-Agent", ev.ua)
+        if ev.rqid:
+            field("ID requête", ev.rqid, curses.A_DIM)
+        if ev.blocked:
+            L.append(("", 0, 0))
+            if not ev.resolved:
+                field("Raison", "corrélation avec l'error.log en cours…", curses.A_DIM)
+                return L
+            rc = self.attr[REASON_COLOR.get(ev.reason, C_WARN)] | curses.A_BOLD
+            field("Raison", ev.reason, rc)
+            if ev.note:
+                field("error.log", ev.note)
+            if ev.rules:
+                L.append(("Règles ModSecurity déclenchées (corrélées par IP + heure ±%ds) :" % int(CORR_WINDOW),
+                          self.attr[C_MAG] | curses.A_BOLD, 0))
+                for rid, msg, deny in ev.rules:
+                    tag = ""
+                    if rid in ANOMALY_IDS:
+                        tag = "  [score global → refus]" if deny else "  [score global]"
+                    elif self.cm is not None and self.cm.excluded(ev.host, rid):
+                        tag = "  [déjà whitelistée]"
+                    head = "  %-8s " % rid
+                    body = textwrap.wrap((msg or "-") + tag, max(10, iw - len(head)),
+                                         break_long_words=True) or ["-"]
+                    a = curses.A_DIM if rid in ANOMALY_IDS else 0
+                    for j, part in enumerate(body):
+                        L.append(((head if j == 0 else " " * len(head)) + part, a, len(head)))
+            elif ev.reason == "modsecurity" and ev.detail:
+                field("Règle", ev.detail, self.attr[C_MAG])
+        return L
+
+    def draw_evdetail(self, h, w):
+        ev = self.sel
+        if ev is None:
+            self.modal = None
+            return
+        bw = min(w - 4, 116)
+        iw = bw - 4
+        lines = self.evdetail_lines(ev, iw)
+        bh = min(h - 2, len(lines) + 3)
+        y0, x0 = max(1, (h - bh) // 2), max(0, (w - bw) // 2)
+        self.clear_rect(y0, x0, bh, bw)
+        title = "Requête %d%s" % (ev.status, " bloquée" if ev.blocked else "")
+        self.box(y0, x0, bh, bw, title)
+        nrows = bh - 3
+        self.evd_top = max(0, min(self.evd_top, max(0, len(lines) - nrows)))
+        for i in range(nrows):
+            idx = self.evd_top + i
+            if idx >= len(lines):
+                break
+            txt, a, lab = lines[idx]
+            yy = y0 + 2 + i
+            if lab:                                  # libelle en gris, valeur avec son attribut
+                self.put(yy, x0 + 2, txt[:lab], curses.A_DIM, iw)
+                self.put(yy, x0 + 2 + lab, txt[lab:], a, iw - lab)
+            else:
+                self.put(yy, x0 + 2, txt, a, iw)
+        foot = "↑↓ requête suivante/précédente · Échap fermer"
+        if len(lines) > nrows:
+            foot = "PgUp/PgDn défiler (%d-%d/%d) · %s" % (
+                self.evd_top + 1, min(len(lines), self.evd_top + nrows), len(lines), foot)
+        self.put(y0 + bh - 1, x0 + max(2, bw - len(foot) - 3), " " + foot + " ", curses.A_DIM, bw - 4)
 
     # -- vue Bans -------------------------------------------------------------------
     def compute_ban_rows(self):
@@ -2889,13 +3135,20 @@ class UI:
     def draw_cols(self, h, w):
         cols = self.cfg["columns"]
         lines = [("Colonnes du flux « Requêtes en direct » (la dernière prend la place restante)", curses.A_DIM),
+                 ("IP, RAISON et SITE s'ajustent au contenu visible ; la largeur réglée est leur maximum.",
+                  curses.A_DIM),
                  ("", 0)]
         for i, c in enumerate(cols):
             d = COLDEF[c["id"]]
-            wd = "auto" if (c["id"] == "ip" and c["width"] == 0) else str(c["width"])
-            txt = " [%s] %-12s largeur %-5s" % ("x" if c["on"] else " ", d[0], wd)
+            if c["id"] == "ip" and c["width"] == 0:
+                wd = "auto (max %d)" % IP_AUTO_MAX
+            elif c["id"] in ELASTIC:
+                wd = "auto (max %d)" % c["width"]
+            else:
+                wd = str(c["width"])
+            txt = " [%s] %-12s largeur %-14s" % ("x" if c["on"] else " ", d[0], wd)
             a = curses.A_REVERSE | curses.A_BOLD if i == self.col_cur else (0 if c["on"] else curses.A_DIM)
-            lines.append((txt.ljust(44), a))
+            lines.append((txt.ljust(52), a))
         lines += [("", 0),
                   ("↑↓ choisir   Espace activer   ←→ largeur   a largeur auto (IP)", curses.A_DIM),
                   ("< > déplacer   d valeurs par défaut   Entrée/Échap fermer et enregistrer", curses.A_DIM)]
@@ -2918,7 +3171,10 @@ class UI:
             ("n            changer d'interface réseau (quand les graphes sont affichés)", 0),
             ("i / v        changer les panneaux du milieu / de droite", 0),
             ("r            remettre les compteurs à zéro", 0),
-            ("↑ ↓ PgUp PgDn Home/End   défiler le flux", 0),
+            ("↑ ↓          sélectionner une requête du flux (fige le flux, le reste continue)", 0),
+            ("Entrée       fiche détail : toutes les propriétés, règles ModSec déclenchées", 0),
+            ("PgUp PgDn    page précédente / suivante    Home  plus ancienne", 0),
+            ("Échap / End  revenir au live (Échap une 2e fois retire le filtre service)", 0),
             ("", 0), ("Bans", self.attr[C_TITLE] | curses.A_BOLD),
             ("u / Suppr    débannir le ban sélectionné (confirmation)", 0),
             ("U            débannir cette IP partout (global + tous les sites)", 0),
@@ -2992,6 +3248,20 @@ class UI:
                 self.flash = (time.monotonic(), "Unban de %s en cours…" % ", ".join(sorted({b["ip"] for b in m[1]})), True)
             self.modal = None
             return
+        if m == "evdetail":
+            if k in (curses.KEY_UP, ord("k")):
+                self.sel_move(+1)
+                self.evd_top = 0
+            elif k in (curses.KEY_DOWN, ord("j")):
+                self.sel_move(-1)
+                self.evd_top = 0
+            elif k == curses.KEY_PPAGE:
+                self.evd_top = max(0, self.evd_top - 5)
+            elif k == curses.KEY_NPAGE:
+                self.evd_top += 5
+            elif k in (10, 13, curses.KEY_ENTER, ESC, ord("q"), curses.KEY_BACKSPACE, 127):
+                self.modal = None
+            return
         if isinstance(m, tuple) and m[0] == "msdetail":
             page = max(1, self.s.getmaxyx()[0] - 10)
             if k in (curses.KEY_UP, ord("k")):
@@ -3018,7 +3288,6 @@ class UI:
             buf = m[1]
             if k in (10, 13, curses.KEY_ENTER):         # valide (auto-completion OU saisie manuelle)
                 self.svc_filter = buf.strip()
-                self.scroll = 0
                 self.modal = None
             elif k == ESC:
                 self.modal = None
@@ -3123,10 +3392,11 @@ class UI:
             self.modal = ("svcfilter", self.svc_filter, 0)
             self.svc_sugg = 0
             return True
-        if k == ESC:                                    # mecanisme simple pour retirer le filtre
-            if self.svc_filter:
+        if k == ESC:                                    # 1) quitte la selection  2) retire le filtre
+            if self.sel is not None:
+                self.go_live()
+            elif self.svc_filter:
                 self.svc_filter = ""
-                self.scroll = 0
                 self.flash = (time.monotonic(), "Filtre service retiré.", True)
             return True
         if k in (ord("p"), ord(" ")):
@@ -3136,7 +3406,6 @@ class UI:
             e.set_window(WINDOWS[self.win_idx][1])
         elif k in (ord("b"), ord("B")):
             self.blocked_only = not self.blocked_only
-            self.scroll = 0
         elif k in (ord("+"), ord("=")):
             self.set_scale(+1)
         elif k in (ord("-"), ord("_")):
@@ -3157,19 +3426,23 @@ class UI:
         elif k in (ord("r"), ord("R")):
             e.reset()
             e.set_window(e.window_secs)
-            self.scroll = 0
+            self.go_live()
         elif k in (curses.KEY_UP, ord("k")):
-            self._scroll(1)
+            self.sel_move(+1)
         elif k in (curses.KEY_DOWN, ord("j")):
-            self._scroll(-1)
+            self.sel_move(-1)
         elif k == curses.KEY_PPAGE:
-            self._scroll(10)
+            self.sel_move(+self.feed_rows if self.sel is not None else 0)
         elif k == curses.KEY_NPAGE:
-            self._scroll(-10)
+            self.sel_move(-self.feed_rows if self.sel is not None else 0)
         elif k in (curses.KEY_HOME, ord("g")):
-            self._scroll(10 ** 6)
+            self.sel_move(0)
+            self.sel_move(-10 ** 9)
         elif k in (curses.KEY_END, ord("G")):
-            self.scroll = 0
+            self.go_live()
+        elif k in (10, 13, curses.KEY_ENTER) and self.sel is not None:
+            self.modal = "evdetail"
+            self.evd_top = 0
         return True
 
     def key_bans(self, k):
@@ -3256,13 +3529,6 @@ class UI:
             self.paused = not self.paused
         return True
 
-    def _scroll(self, d):
-        if self.scroll == 0 and d > 0:
-            self.anchor = self.e.seq
-        cur = self.scroll + ((self.e.seq - self.anchor) if self.scroll > 0 else 0)
-        new = max(0, cur + d)
-        self.scroll = new
-        self.anchor = self.e.seq
 
 
 # Sequences que certains terminaux envoient meme quand terminfo ne les decrit pas

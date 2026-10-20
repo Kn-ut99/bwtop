@@ -49,7 +49,13 @@ installé sur la machine cible.
   déduite de l'`error.log` par corrélation IP + horodatage, et la règle CRS
   précise (ex. `942100 SQL Injection…`) est affichée.
 - **Flux en direct** avec **colonnes configurables** (heure, IP, code, raison,
-  site, méthode, taille, user-agent, URL), largeur et ordre réglables.
+  site, méthode, taille, user-agent, URL), largeur et ordre réglables. Les
+  colonnes IP, raison et site **s'ajustent au contenu** pour laisser la place à
+  l'URL ; la raison est compacte (`modsec 942100`, `rate-limit`…).
+- **Sélection d'une requête + fiche détail** : les flèches figent le flux et
+  sélectionnent une ligne, `Entrée` affiche toutes ses propriétés **non
+  tronquées** (IPv6, URL, user-agent, référent, ID de requête, cause complète)
+  et **toutes les règles ModSecurity déclenchées**.
 - **Filtre global par service** (`/`) : restreint l'ensemble du tableau de bord
   à un seul site, avec auto-complétion des services vus et bandeau d'état.
 - **Graphes système** optionnels (`S`) : CPU (moyenne + historique), RAM et
@@ -145,7 +151,25 @@ Bascule avec `Tab` ou les touches `1` / `2` / `3`. `h` ouvre l'aide, `q` quitte.
 `p` pause · `w` fenêtre (1 m→5 m→15 m→1 h) · `b` bloquées seulement ·
 `/` **filtrer tout le tableau sur un service** · `S` **graphes système** ·
 `n` interface réseau · `c`/`F2` colonnes · `+`/`-` échelle du graphe ·
-`i`/`v` panneaux · `r` reset · `↑↓ PgUp/PgDn` défiler.
+`i`/`v` panneaux · `r` reset · `↑↓` sélectionner une requête · `Entrée` fiche
+détail · `Échap` retour au live.
+
+**Sélection et fiche détail.** Par défaut le flux est en mode *live*, sans
+surlignage. La première flèche `↑`/`↓` **fige le flux** et sélectionne la
+requête la plus récente ; le cadre affiche alors `SÉLECTION · +N plus récentes`
+(les compteurs et le graphe continuent de tourner, seul le flux est figé).
+`↑↓` déplacent la sélection, `PgUp`/`PgDn` par page, `Home` va à la plus
+ancienne. `Entrée` ouvre la **fiche** de la requête : date complète, IP
+(signalée si bannie), site, code, taille, méthode, URL, référent, user-agent,
+`$request_id`, raison, ligne d'`error.log` à l'origine du blocage et **liste des
+règles ModSecurity déclenchées** (règle de score global en dernier, règles déjà
+whitelistées signalées). Dans la fiche, `↑↓` passent à la requête suivante ou
+précédente. `Échap` ferme la fiche, puis revient au live ; un second `Échap`
+retire le filtre service.
+
+Pour la fiche, les requêtes **bloquées** sont conservées quasiment entières
+(URL jusqu'à 8 Ko) ; les requêtes autorisées sont plafonnées (URL 1 Ko,
+user-agent 300 caractères) pour borner la mémoire.
 
 Le filtre `/` applique un **filtre global par service** : tout le tableau de
 bord (compteurs, codes, raisons, graphe, flux) ne reflète alors que le service
@@ -339,7 +363,10 @@ Les secrets restent dans `bwtop.env` (0600), jamais dans `config.json`.
   bans, et l'application des exclusions ; l'UI curses reste réactive.
 - **Raison d'un blocage** : l'`access.log` donne le code, l'`error.log` la
   cause. bwtop corrèle par IP + horodatage (±5 s) + URI, et préfère la règle
-  CRS contributrice à la règle de score global (949110).
+  CRS contributrice à la règle de score global (949110). Toutes les règles
+  corrélées sont gardées pour la fiche détail ; elles ne sont rattachées qu'aux
+  requêtes bloquées par ModSecurity (une requête refusée par la blacklist ou le
+  rate-limit n'atteint pas ModSecurity).
 - **Exclusions** : type `modsec` (`SecRuleRemoveById`), appliquées via la base
   (API) ou par fichier + restart du scheduler (le reload ne réimporte pas les
   fichiers posés à la main).
